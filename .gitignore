@@ -1,0 +1,16 @@
+.gradle/
+.git-old-*/
+.idea/
+build/
+**/build/
+local.properties
+*.iml
+*.apk
+!releases/**/*.apk
+*.aab
+captures/
+externalNativeBuild/
+.cxx/
+third_party/mnn/extracted/
+third_party/mnn/models/
+contest_mobile_ai_challenge/

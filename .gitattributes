@@ -1,0 +1,15 @@
+* text=auto
+
+*.bat text eol=crlf
+*.gradle text
+*.kt text
+*.md text
+*.properties text
+
+*.apk binary
+*.png binary
+*.pdf binary
+*.docx binary
+*.pptx binary
+*.xlsx binary
+*.so binary
