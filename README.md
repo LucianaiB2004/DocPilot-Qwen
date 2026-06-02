@@ -1,13 +1,14 @@
 # DocPilot Qwen
 
 <img src="./assets/readme/cover.png" alt="DocPilot Qwen 封面" width="100%">
+> 本项目使用 KAT-Coder-Pro V2 搭建
 
 ## 下载 APK
 
 Android 用户可以直接下载当前 Debug 安装包：
 
 [下载 DocPilotQwen-1.0.0-debug.apk](./releases/DocPilotQwen-1.0.0-debug/DocPilotQwen-1.0.0-debug.apk)
-> 本项目使用 KAT-Coder-Pro V2 搭建
+
 
 DocPilot Qwen 是一个面向 Android 手机的开源文档 AI 助手。它把文档导入、TextIn 解析、Qwen 问答、摘要生成、模板抽取和本地记录整理到一个原生 App 里，让手机也能完成日常学习、论文阅读、报告整理和办公文档分析。
 
