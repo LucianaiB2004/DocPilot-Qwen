@@ -1,7 +1,10 @@
 # DocPilot Qwen
 
 <img src="./assets/readme/cover.png" alt="DocPilot Qwen 封面" width="100%">
-> 本项目使用 KAT-Coder-Pro V2 搭建
+
+```md
+本项目使用 KAT-Coder-Pro V2 搭建 
+```
 
 ## 下载 APK
 
