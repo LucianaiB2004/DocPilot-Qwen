@@ -3,6 +3,7 @@ package com.docpilot.qwen.ui
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
@@ -30,6 +31,7 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 data class DocPilotUiState(
     val documents: List<DocumentEntity> = emptyList(),
@@ -101,6 +103,9 @@ private data class SettingsUiState(
     val accelerationEngine: String,
     val cloudModel: String
 )
+
+private const val FILE_READ_TIMEOUT_MS = 45_000L
+private const val TAG = "DocPilot"
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DocPilotViewModel(
@@ -287,6 +292,7 @@ class DocPilotViewModel(
 
     init {
         viewModelScope.launch {
+            repository.finishInterruptedGenerations()
             repository.seedDemoData()
         }
         viewModelScope.launch {
@@ -477,38 +483,58 @@ class DocPilotViewModel(
             val id = repository.registerImportedDocument(uri, displayName, type, sizeLabel)
             selectedDocumentId.value = id
             recentOpenedIds.value = (listOf(id) + recentOpenedIds.value.filterNot { it == id }).take(20)
-            val parallelism = effectiveParseParallelism()
-            status.value = "正在读取并解析 · ${accelerationEngine.value} ${parallelism}线程"
-            val bytes = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
-                getApplication<Application>().contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            }
-            if (bytes == null) {
-                status.value = "读取文件失败"
-            } else {
-                withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
-                    repository.parseWithTextIn(id, displayName, bytes)
-                }
-                status.value = "解析流程已完成"
-            }
+            status.value = "已导入 $displayName，点击“分析”后调用 TextIn"
         }
     }
 
     fun analyzeDocument(documentId: Long) {
         val doc = uiState.value.documents.firstOrNull { it.id == documentId } ?: return
+        val resultKey = analysisResultKey(documentId)
+        if (workingTask.value == resultKey) {
+            Log.w(TAG, "Analyze ignored: documentId=$documentId reason=already_running")
+            status.value = "该文档正在分析中，请等待 TextIn 返回"
+            return
+        }
+        workingTask.value = resultKey
         viewModelScope.launch {
+            Log.i(TAG, "Analyze clicked: documentId=$documentId name=${doc.name} status=${doc.status} source=${doc.sourceUri}")
             selectedDocumentId.value = documentId
             val parallelism = effectiveParseParallelism()
-            status.value = "正在分析 · ${accelerationEngine.value} ${parallelism}线程"
-            val bytes = withContext(Dispatchers.IO.limitedParallelism(parallelism)) { readDocumentBytes(doc) }
-            if (bytes == null) {
-                status.value = "无法读取文档文件"
-            } else {
-                withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
+            try {
+                repository.markDocumentStatus(documentId, "准备分析", 1)
+                status.value = "正在读取文档 · ${accelerationEngine.value} ${parallelism}线程"
+                val bytes = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
+                    withTimeout(FILE_READ_TIMEOUT_MS) { readDocumentBytes(doc) }
+                }
+                Log.i(TAG, "Analyze file read: documentId=$documentId bytes=${bytes?.size ?: 0}")
+                if (bytes == null) {
+                    repository.markDocumentStatus(documentId, "读取文件失败", 100)
+                    insightResults.value = insightResults.value + (resultKey to "## 分析失败\n- 无法读取文档文件，请重新导入后再分析。")
+                    status.value = "无法读取文档文件"
+                    return@launch
+                }
+                status.value = "正在调用 TextIn 解析"
+                Log.i(TAG, "Analyze TextIn start: documentId=$documentId bytes=${bytes.size}")
+                val parse = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
                     repository.parseWithTextIn(documentId, doc.name, bytes)
                 }
+                Log.i(TAG, "Analyze TextIn done: documentId=$documentId success=${parse.success} message=${parse.message}")
+                if (!parse.success) {
+                    insightResults.value = insightResults.value + (resultKey to "## TextIn 解析未完成\n- ${parse.message}\n- 未继续调用 AI，避免基于不完整内容生成误导结果。")
+                    status.value = "TextIn 解析未完成：${parse.message}"
+                    return@launch
+                }
+                status.value = "TextIn 完成，正在调用 AI 分析"
+                Log.i(TAG, "Analyze AI start: documentId=$documentId cloud=${cloudEnabled.value} model=${cloudModel.value}")
                 val result = repository.generateDocumentInsight(documentId, "摘要", cloudEnabled.value, cloudModel.value, localGenerationConfig(doc))
                 insightResults.value = insightResults.value + (analysisResultKey(documentId) to result)
                 status.value = "TextIn 解析与 AI 分析完成"
+            } catch (error: Throwable) {
+                repository.markDocumentStatus(documentId, "分析失败", 100)
+                insightResults.value = insightResults.value + (resultKey to "## 分析失败\n- ${error.message ?: error::class.java.simpleName}")
+                status.value = "分析失败：${error.message ?: error::class.java.simpleName}"
+            } finally {
+                workingTask.value = ""
             }
         }
     }
@@ -517,7 +543,11 @@ class DocPilotViewModel(
         val state = uiState.value
         val doc = state.selectedDocument ?: return
         viewModelScope.launch {
-            status.value = if (cloudEnabled.value) "Qwen 思考中" else "本地规则兜底回答"
+            status.value = when {
+                cloudEnabled.value -> "Qwen 思考中"
+                state.localRuntimeStatus == "MNN 就绪" -> "MNN 本地模型生成中"
+                else -> "本地规则兜底回答"
+            }
             runCatching {
                 val context = doc.markdown.ifBlank {
                     """
@@ -593,44 +623,62 @@ class DocPilotViewModel(
         val doc = uiState.value.selectedDocument ?: return
         viewModelScope.launch {
             val resultKey = insightResultKey(doc.id, mode)
-            workingTask.value = resultKey
-            status.value = "正在生成 $mode · ${if (cloudEnabled.value) cloudModel.value else "本地"}"
-            val prompt = insightPromptText(mode)
-            val result = runCatching {
-                repository.generateDocumentInsight(doc.id, mode, cloudEnabled.value, cloudModel.value, localGenerationConfig(doc))
-            }.getOrElse {
-                "## $mode 生成失败\n- 异常：${it.message ?: it::class.java.simpleName}\n- 请稍后重试，或先检查云端/API/本地模型设置。"
+            try {
+                workingTask.value = resultKey
+                status.value = "正在生成 $mode · ${if (cloudEnabled.value) cloudModel.value else "本地"}"
+                val prompt = insightPromptText(mode)
+                val result = runCatching {
+                    repository.generateDocumentInsight(doc.id, mode, cloudEnabled.value, cloudModel.value, localGenerationConfig(doc))
+                }.getOrElse {
+                    "## $mode 生成失败\n- 异常：${it.message ?: it::class.java.simpleName}\n- 请稍后重试，或先检查云端/API/本地模型设置。"
+                }
+                insightResults.value = insightResults.value + (resultKey to result)
+                repository.appendAssistantExchange(doc.id, prompt, result, if (cloudEnabled.value) cloudModel.value else "本地规则")
+                status.value = "$mode 已生成"
+            } finally {
+                workingTask.value = ""
             }
-            insightResults.value = insightResults.value + (resultKey to result)
-            repository.appendAssistantExchange(doc.id, prompt, result, if (cloudEnabled.value) cloudModel.value else "本地规则")
-            workingTask.value = ""
-            status.value = "$mode 已生成"
         }
     }
 
     fun extractTemplate(templateName: String, customInstruction: String = "") {
         val doc = uiState.value.selectedDocument ?: return
+        val resultKey = templateResultKey(doc.id, templateName, customInstruction)
+        if (workingTask.value == resultKey) {
+            Log.w(TAG, "TextIn extract ignored: documentId=${doc.id} template=$templateName reason=already_running")
+            status.value = "$templateName 正在抽取中，请等待 TextIn 返回"
+            return
+        }
+        workingTask.value = resultKey
         viewModelScope.launch {
-            val resultKey = templateResultKey(doc.id, templateName, customInstruction)
-            workingTask.value = resultKey
+            Log.i(TAG, "TextIn extract clicked: documentId=${doc.id} name=${doc.name} template=$templateName")
             val parallelism = effectiveParseParallelism()
-            status.value = "正在抽取 · ${accelerationEngine.value} ${parallelism}线程"
-            val bytes = withContext(Dispatchers.IO.limitedParallelism(parallelism)) { readDocumentBytes(doc) }
-            val result = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
-                repository.extractTemplate(
-                    documentId = doc.id,
-                    templateName = templateName,
-                    fileName = doc.name,
-                    fileBytes = bytes,
-                    customInstruction = customInstruction,
-                    useCloud = cloudEnabled.value,
-                    cloudModel = cloudModel.value,
-                    localConfig = localGenerationConfig(doc)
-                )
+            try {
+                status.value = "正在调用 TextIn 抽取上下文 · ${accelerationEngine.value} ${parallelism}线程"
+                val bytes = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
+                    withTimeout(FILE_READ_TIMEOUT_MS) { readDocumentBytes(doc) }
+                }
+                Log.i(TAG, "TextIn extract file read: documentId=${doc.id} bytes=${bytes?.size ?: 0}")
+                val result = withContext(Dispatchers.IO.limitedParallelism(parallelism)) {
+                    repository.extractTemplate(
+                        documentId = doc.id,
+                        templateName = templateName,
+                        fileName = doc.name,
+                        fileBytes = bytes,
+                        customInstruction = customInstruction,
+                        useCloud = cloudEnabled.value,
+                        cloudModel = cloudModel.value,
+                        localConfig = localGenerationConfig(doc)
+                    )
+                }
+                templateResults.value = templateResults.value + (resultKey to result)
+                status.value = "$templateName 已抽取"
+            } catch (error: Throwable) {
+                templateResults.value = templateResults.value + (resultKey to "## $templateName 抽取失败\n- ${error.message ?: error::class.java.simpleName}")
+                status.value = "$templateName 抽取失败：${error.message ?: error::class.java.simpleName}"
+            } finally {
+                workingTask.value = ""
             }
-            templateResults.value = templateResults.value + (resultKey to result)
-            workingTask.value = ""
-            status.value = "$templateName 已抽取"
         }
     }
 
@@ -685,7 +733,7 @@ class DocPilotViewModel(
             accelerationEngine = accelerationEngine.value,
             maxTokens = if (performanceMode.value == "极速模式") 1024 else 768,
             imagePaths = resolveLocalImagePath(document)?.let { listOf(it) }.orEmpty(),
-            enableMnn = false
+            enableMnn = true
         )
     }
 

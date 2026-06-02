@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -104,6 +105,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import androidx.compose.ui.text.AnnotatedString
@@ -134,15 +136,18 @@ import com.docpilot.qwen.ui.theme.Muted
 import com.docpilot.qwen.ui.theme.SoftBlue
 import com.docpilot.qwen.ui.theme.SuccessGreen
 import com.docpilot.qwen.ui.theme.WarningOrange
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonParser
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlin.math.roundToInt
 
 private enum class Screen(val route: String, val label: String, val icon: ImageVector) {
     Home("home", "首页", Icons.Default.Home),
     Reader("reader", "文档", Icons.Default.Article),
     Assistant("assistant", "AI 助手", Icons.Default.AutoAwesome),
-    Templates("templates", "模板", Icons.Default.FileCopy),
+    Templates("templates", "TextIn", Icons.Default.FileCopy),
     Settings("settings", "设置", Icons.Default.Settings)
 }
 
@@ -742,7 +747,7 @@ private fun TemplatesScreen(
         .sortedByDescending { it.id }
     ScrollScreenFrame {
         Header(
-            title = "提取模板",
+            title = "TextIn 提取",
             subtitle = state.selectedDocument?.name ?: "未选择文档",
             trailing = Icons.Default.Save,
             onTrailingClick = {
@@ -768,6 +773,7 @@ private fun TemplatesScreen(
             Triple("合同要点", Icons.Default.TextSnippet, BrandBlue),
             Triple("论文笔记", Icons.Default.Article, WarningOrange),
             Triple("表格字段抽取", Icons.Default.TableChart, SuccessGreen),
+            Triple("发票信息提取", Icons.Default.TextSnippet, WarningOrange),
             Triple("自定义提取", Icons.Default.Search, BrandBlue)
         )
         LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -863,9 +869,11 @@ private fun SettingsScreen(
     val performanceModes = listOf("省电模式", "均衡模式", "极速模式")
     val accelerationEngines = listOf("系统 IO", "并行队列", "MNN (Arm SME2)", "省电队列")
     val cloudModels = listOf(
+        CloudModelOption("qwen3-vl-plus", "Qwen3-VL Plus", "图片、扫描件和多模态文档问答"),
         CloudModelOption("qwen3.7-max", "Qwen3.7 Max", "复杂推理、合同/报告分析，质量优先"),
         CloudModelOption("qwen3.6-plus", "Qwen3.6 Plus", "通用文档问答与摘要，默认推荐"),
         CloudModelOption("qwen3.6-flash", "Qwen3.6 Flash", "快速问答、轻量抽取，速度优先"),
+        CloudModelOption("qwen-plus", "Qwen Plus", "百炼通用稳定模型，适合兼容性验证"),
         CloudModelOption("qwen3.5-plus", "Qwen3.5 Plus", "稳定通用任务，兼顾成本与质量"),
         CloudModelOption("qwen3.5-flash", "Qwen3.5 Flash", "低延迟批量摘要和短问答")
     )
@@ -1141,7 +1149,7 @@ private fun NotificationPanel(state: DocPilotUiState) {
             Bullet("最近导入：${it.name}（${it.status}）")
         }
         latestExtraction?.let {
-            Bullet("最近模板：${it.templateName}，来源 ${it.source}")
+            Bullet("最近 TextIn：${it.templateName}，来源 ${it.source}")
         }
         if (state.recentQuestions.isNotEmpty()) {
             Bullet("最近提问：${state.recentQuestions.first().content.take(36)}")
@@ -1173,7 +1181,7 @@ private fun ReaderActionPanel(
             Button(onClick = onOpenAssistant, modifier = Modifier.weight(1f)) { Text("问答") }
         }
         Button(onClick = onOpenTemplates, modifier = Modifier.fillMaxWidth()) {
-            Text("进入模板抽取")
+            Text("进入 TextIn 提取")
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(ExportFormat.values().toList()) { format ->
@@ -1501,9 +1509,68 @@ private fun DocumentFullPreview(doc: DocumentEntity?) {
 private fun DocumentReadablePreview(doc: DocumentEntity) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         SourceTag("分析结果预览 · ${doc.type} · ${doc.sizeLabel}")
-        CardBlock {
-            MarkdownText(doc.markdown)
-        }
+        DocumentPreviewWebView(title = doc.name, content = doc.markdown)
+    }
+}
+
+@Composable
+private fun DocumentPreviewWebView(title: String, content: String) {
+    val html = remember(title, content) { documentPreviewHtml(title, content) }
+    val density = LocalDensity.current
+    var previewHeight by remember(html) { mutableStateOf(560.dp) }
+    fun updatePreviewHeight(webView: WebView) {
+        webView.postDelayed(
+            {
+                val contentPx = (webView.contentHeight * webView.scale).roundToInt()
+                if (contentPx > 0) {
+                    previewHeight = with(density) {
+                        contentPx.toDp()
+                    }.coerceAtLeast(560.dp) + 16.dp
+                }
+            },
+            120L
+        )
+    }
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, Color(0xFFE5E7EB)),
+        color = Color.White,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        AndroidView(
+            factory = { context ->
+                WebView(context).apply {
+                    setBackgroundColor(android.graphics.Color.WHITE)
+                    settings.javaScriptEnabled = false
+                    settings.domStorageEnabled = false
+                    settings.allowFileAccess = false
+                    settings.allowContentAccess = false
+                    settings.builtInZoomControls = false
+                    settings.displayZoomControls = false
+                    settings.loadWithOverviewMode = true
+                    settings.useWideViewPort = true
+                    settings.textZoom = 100
+                    isVerticalScrollBarEnabled = false
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String?) {
+                            updatePreviewHeight(view)
+                        }
+                    }
+                }
+            },
+            update = { webView ->
+                if (webView.tag != html) {
+                    webView.tag = html
+                    previewHeight = 560.dp
+                    webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+                } else {
+                    updatePreviewHeight(webView)
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(previewHeight)
+        )
     }
 }
 
@@ -1665,13 +1732,13 @@ private fun TemplateResult(template: String, generated: String?, isWorking: Bool
             SectionHeader("抽取结果", "本次结果")
             MarkdownText(generated)
         }
-        OutlinedButton(onClick = onExtract, modifier = Modifier.fillMaxWidth()) {
-            Text("重新抽取 $template")
+        OutlinedButton(onClick = onExtract, enabled = !isWorking, modifier = Modifier.fillMaxWidth()) {
+            Text(if (isWorking) "TextIn 正在抽取..." else "重新抽取 $template")
         }
         return
     }
 
-    Button(onClick = onExtract, modifier = Modifier.fillMaxWidth()) {
+    Button(onClick = onExtract, enabled = !isWorking, modifier = Modifier.fillMaxWidth()) {
         Icon(Icons.Default.AutoAwesome, contentDescription = null)
         Spacer(Modifier.width(8.dp))
         Text(if (isWorking) "TextIn 正在抽取..." else "基于 TextIn 抽取 $template")
@@ -1707,7 +1774,7 @@ private fun TemplateHistoryList(
                             Spacer(Modifier.width(10.dp))
                             Icon(
                                 Icons.Default.Delete,
-                                contentDescription = "删除模板历史",
+                                contentDescription = "删除 TextIn 历史",
                                 tint = DangerRed,
                                 modifier = Modifier.size(20.dp).clickable { onDelete(item.id) }
                             )
@@ -1749,6 +1816,18 @@ private fun MarkdownText(text: String) {
                 index += 1
                 continue
             }
+            if (line.startsWith("```")) {
+                val language = line.removePrefix("```").trim()
+                index += 1
+                val codeLines = mutableListOf<String>()
+                while (index < lines.size && !lines[index].trim().startsWith("```")) {
+                    codeLines += lines[index]
+                    index += 1
+                }
+                if (index < lines.size) index += 1
+                MarkdownCodeBlock(codeLines.joinToString("\n"), language)
+                continue
+            }
             if (line.isMarkdownTableRow()) {
                 val tableLines = mutableListOf<String>()
                 while (index < lines.size && lines[index].trim().isMarkdownTableRow()) {
@@ -1767,6 +1846,35 @@ private fun MarkdownText(text: String) {
             }
             index += 1
         }
+    }
+}
+
+@Composable
+private fun MarkdownCodeBlock(text: String, language: String = "") {
+    val formatted = remember(text, language) {
+        if (language.equals("json", ignoreCase = true) || text.trim().looksLikeJson()) {
+            formatJsonForDisplay(text)
+        } else {
+            text.trimEnd()
+        }
+    }
+    val horizontal = rememberScrollState()
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, Color(0xFFE5E7EB)),
+        color = Color(0xFFF8FAFC),
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(horizontal)
+    ) {
+        Text(
+            formatted.ifBlank { "暂无内容" },
+            color = Ink,
+            fontSize = 12.sp,
+            lineHeight = 18.sp,
+            fontFamily = FontFamily.Monospace,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+        )
     }
 }
 
@@ -1807,18 +1915,75 @@ private fun MarkdownTable(rows: List<List<String>>) {
 
 @Composable
 private fun ReadableJsonText(text: String) {
+    val formatted = remember(text) { formatJsonForDisplay(text) }
+    MarkdownCodeBlock(formatted.ifBlank { """{"message": "暂无 JSON"}""" }, "json")
+}
+
+private fun formatJsonForDisplay(text: String): String {
     val cleaned = text
         .replace("TextInParseResponse(", "")
         .replace("TextInParseResult(", "")
         .replace("),", ",")
-        .replace(")", "")
-    Text(
-        cleaned.ifBlank { """{"message":"暂无 JSON"}""" },
-        color = Ink,
-        fontSize = 12.sp,
-        lineHeight = 18.sp,
-        fontFamily = FontFamily.Monospace
-    )
+        .removeSuffix(")")
+        .trim()
+    if (cleaned.isBlank()) return ""
+    return runCatching {
+        val json = JsonParser.parseString(cleaned)
+        GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create().toJson(json)
+    }.getOrElse {
+        prettyPrintLooseJson(cleaned)
+    }
+}
+
+private fun prettyPrintLooseJson(text: String): String {
+    val out = StringBuilder()
+    var indent = 0
+    var inString = false
+    var escape = false
+    fun newline() {
+        out.append('\n')
+        repeat(indent.coerceAtLeast(0)) { out.append("  ") }
+    }
+    text.forEach { char ->
+        when {
+            escape -> {
+                out.append(char)
+                escape = false
+            }
+            char == '\\' && inString -> {
+                out.append(char)
+                escape = true
+            }
+            char == '"' -> {
+                out.append(char)
+                inString = !inString
+            }
+            inString -> out.append(char)
+            char == '{' || char == '[' -> {
+                out.append(char)
+                indent += 1
+                newline()
+            }
+            char == '}' || char == ']' -> {
+                indent -= 1
+                newline()
+                out.append(char)
+            }
+            char == ',' -> {
+                out.append(char)
+                newline()
+            }
+            char == ':' -> out.append(": ")
+            else -> out.append(char)
+        }
+    }
+    return out.toString().lines().joinToString("\n") { it.trimEnd() }
+}
+
+private fun String.looksLikeJson(): Boolean {
+    val cleaned = trim()
+    return (cleaned.startsWith("{") && cleaned.endsWith("}")) ||
+        (cleaned.startsWith("[") && cleaned.endsWith("]"))
 }
 
 private fun markdownInline(line: String): AnnotatedString = buildAnnotatedString {
@@ -2166,12 +2331,32 @@ private fun extractMarkdownTableRows(markdown: String): List<List<String>> {
         .filter { cells -> cells.any { it.isNotBlank() } }
 }
 
+private fun documentPreviewHtml(title: String, content: String): String {
+    val normalized = content.decodePreviewHtmlEntities().sanitizePreviewHtml()
+    return if (normalized.looksLikeFullHtmlDocument()) {
+        val body = normalized
+            .replace(Regex("""(?is)^.*?<body[^>]*>"""), "")
+            .replace(Regex("""(?is)</body>.*$"""), "")
+        previewHtmlShell(title, body)
+    } else {
+        markdownToPreviewHtml(title, normalized)
+    }
+}
+
 private fun markdownToPreviewHtml(title: String, markdown: String): String {
     val body = buildString {
         var inTable = false
         markdown.lines().forEach { raw ->
             val line = raw.trim()
             if (line.isBlank()) return@forEach
+            if (line.isHtmlBlockLine()) {
+                if (inTable) {
+                    append("</table>")
+                    inTable = false
+                }
+                append(line)
+                return@forEach
+            }
             if (line.startsWith("|") && line.endsWith("|")) {
                 val cells = line.trim('|').split('|').map { it.trim() }
                 val divider = cells.all { it.replace("-", "").replace(":", "").isBlank() }
@@ -2181,7 +2366,7 @@ private fun markdownToPreviewHtml(title: String, markdown: String): String {
                         inTable = true
                     }
                     append("<tr>")
-                    cells.forEach { append("<td>${it.escapeHtml().markdownInlineHtml()}</td>") }
+                    cells.forEach { append("<td>${it.toPreviewInlineHtml()}</td>") }
                     append("</tr>")
                 }
                 return@forEach
@@ -2191,30 +2376,41 @@ private fun markdownToPreviewHtml(title: String, markdown: String): String {
                 inTable = false
             }
             when {
-                line.startsWith("##") -> append("<h2>${line.trimStart('#', ' ').escapeHtml().markdownInlineHtml()}</h2>")
-                line.startsWith("#") -> append("<h1>${line.trimStart('#', ' ').escapeHtml().markdownInlineHtml()}</h1>")
-                line.startsWith("-") || line.startsWith("•") -> append("<p class='bullet'>• ${line.trimStart('-', '•', ' ').escapeHtml().markdownInlineHtml()}</p>")
-                Regex("""^\d+\.""").containsMatchIn(line) -> append("<p class='bullet'>${line.escapeHtml().markdownInlineHtml()}</p>")
-                else -> append("<p>${line.escapeHtml().markdownInlineHtml()}</p>")
+                line.startsWith("##") -> append("<h2>${line.trimStart('#', ' ').toPreviewInlineHtml()}</h2>")
+                line.startsWith("#") -> append("<h1>${line.trimStart('#', ' ').toPreviewInlineHtml()}</h1>")
+                line.startsWith("-") || line.startsWith("•") -> append("<p class='bullet'>• ${line.trimStart('-', '•', ' ').toPreviewInlineHtml()}</p>")
+                Regex("""^\d+\.""").containsMatchIn(line) -> append("<p class='bullet'>${line.toPreviewInlineHtml()}</p>")
+                else -> append("<p>${line.toPreviewInlineHtml()}</p>")
             }
         }
         if (inTable) append("</table>")
     }
+    return previewHtmlShell(title, body)
+}
+
+private fun previewHtmlShell(title: String, body: String): String {
     return """
         <!doctype html>
         <html>
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
             <style>
+                html, body { height: auto !important; overflow: visible !important; }
+                * { box-sizing: border-box; max-width: 100%; }
                 body { font-family: sans-serif; color: #111827; margin: 16px; line-height: 1.65; font-size: 15px; }
+                body * { overflow: visible !important; }
+                [class*="page"], [id*="page"], .page { height: auto !important; min-height: 0 !important; }
                 h1 { font-size: 22px; margin: 0 0 14px; }
                 h2 { font-size: 18px; margin: 18px 0 8px; color: #0B5FFF; }
                 p { margin: 7px 0; }
                 .doc-title { color: #64748B; font-size: 13px; margin-bottom: 12px; }
                 .bullet { padding-left: 8px; }
+                img { max-width: 100%; height: auto; border-radius: 10px; }
+                pre, code { white-space: pre-wrap; word-break: break-word; background: #F8FAFC; border-radius: 8px; }
+                pre { padding: 10px; overflow-x: auto; }
                 table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
-                td { border: 1px solid #D9E2F1; padding: 8px; vertical-align: top; }
-                tr:first-child td { background: #EFF6FF; font-weight: 700; }
+                th, td { border: 1px solid #D9E2F1; padding: 8px; vertical-align: top; }
+                th, tr:first-child td { background: #EFF6FF; font-weight: 700; }
                 strong { font-weight: 700; }
             </style>
         </head>
@@ -2233,6 +2429,51 @@ private fun String.escapeHtml(): String = replace("&", "&amp;")
 
 private fun String.markdownInlineHtml(): String =
     replace(Regex("""\*\*(.+?)\*\*"""), "<strong>$1</strong>")
+
+private fun String.toPreviewInlineHtml(): String {
+    return if (containsHtmlTag()) {
+        markdownInlineHtml()
+    } else {
+        escapeHtml().markdownInlineHtml()
+    }
+}
+
+private fun String.decodePreviewHtmlEntities(): String {
+    var decoded = this
+    repeat(2) {
+        decoded = decoded
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#34;", "\"", ignoreCase = true)
+            .replace("&#39;", "'", ignoreCase = true)
+            .replace("&apos;", "'", ignoreCase = true)
+            .replace("&nbsp;", " ", ignoreCase = true)
+            .replace("&amp;", "&", ignoreCase = true)
+    }
+    return decoded
+}
+
+private fun String.sanitizePreviewHtml(): String {
+    return replace(Regex("""(?is)<script\b[^>]*>.*?</script>"""), "")
+        .replace(Regex("""(?is)<iframe\b[^>]*>.*?</iframe>"""), "")
+        .replace(Regex("""(?is)<object\b[^>]*>.*?</object>"""), "")
+        .replace(Regex("""(?is)<embed\b[^>]*>.*?</embed>"""), "")
+        .replace(Regex("""(?i)\s+on[a-z]+\s*=\s*"[^"]*""""), "")
+        .replace(Regex("""(?i)\s+on[a-z]+\s*=\s*'[^']*'"""), "")
+        .replace(Regex("""(?i)javascript:"""), "")
+}
+
+private fun String.looksLikeFullHtmlDocument(): Boolean =
+    Regex("""(?is)<\s*html\b|<\s*body\b""").containsMatchIn(this)
+
+private fun String.containsHtmlTag(): Boolean =
+    Regex("""(?is)<\s*/?\s*(div|section|article|p|span|table|thead|tbody|tr|td|th|h[1-6]|ul|ol|li|br|img|strong|b|em|i|u|pre|code|style)\b[^>]*>""").containsMatchIn(this)
+
+private fun String.isHtmlBlockLine(): Boolean {
+    val trimmed = trim()
+    return trimmed.containsHtmlTag() && Regex("""(?is)^<\s*/?\s*(div|section|article|p|table|thead|tbody|tr|td|th|h[1-6]|ul|ol|li|br|img|pre|style)\b""").containsMatchIn(trimmed)
+}
 
 @Composable
 private fun EmptyHint(text: String) {

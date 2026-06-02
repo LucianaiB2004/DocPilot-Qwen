@@ -1,5 +1,6 @@
 package com.docpilot.qwen.data.network
 
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
@@ -11,6 +12,19 @@ class NetworkModule(qwenBaseUrl: String, textInBaseUrl: String) {
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(90, TimeUnit.SECONDS)
         .writeTimeout(90, TimeUnit.SECONDS)
+        .addInterceptor { chain ->
+            val request = chain.request()
+            val start = System.currentTimeMillis()
+            Log.i("DocPilot", "HTTP start ${request.method} ${request.url}")
+            try {
+                val response = chain.proceed(request)
+                Log.i("DocPilot", "HTTP done ${response.code} ${request.url} ${System.currentTimeMillis() - start}ms")
+                response
+            } catch (error: Throwable) {
+                Log.e("DocPilot", "HTTP failed ${request.url} ${System.currentTimeMillis() - start}ms", error)
+                throw error
+            }
+        }
         .addInterceptor(HttpLoggingInterceptor().apply {
             level = HttpLoggingInterceptor.Level.BASIC
         })

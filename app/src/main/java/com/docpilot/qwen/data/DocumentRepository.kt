@@ -1,6 +1,8 @@
 package com.docpilot.qwen.data
 
 import android.net.Uri
+import android.util.Base64
+import android.util.Log
 import com.docpilot.qwen.data.local.ChatMessageEntity
 import com.docpilot.qwen.data.local.DocumentDao
 import com.docpilot.qwen.data.local.DocumentEntity
@@ -10,14 +12,30 @@ import com.docpilot.qwen.data.local.LocalModelEngine
 import com.docpilot.qwen.data.local.PageCitation
 import com.docpilot.qwen.data.network.QwenApi
 import com.docpilot.qwen.data.network.QwenChatRequest
+import com.docpilot.qwen.data.network.QwenChatResponse
 import com.docpilot.qwen.data.network.QwenMessage
 import com.docpilot.qwen.data.network.QwenStreamClient
 import com.docpilot.qwen.data.network.TextInApi
+import com.docpilot.qwen.data.network.TextInExtractionField
+import com.docpilot.qwen.data.network.TextInExtractionRequest
+import com.docpilot.qwen.data.network.TextInExtractionResponse
+import com.docpilot.qwen.data.network.TextInExtractionTable
+import com.docpilot.qwen.data.network.TextInParseResponse
+import com.docpilot.qwen.data.network.TextInParseResult
 import com.docpilot.qwen.security.ApiKeyStore
 import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import retrofit2.Response
+import java.io.File
 import java.io.IOException
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
@@ -32,6 +50,7 @@ class DocumentRepository(
     private val localModelEngine: LocalModelEngine
 ) {
     private val gson = Gson()
+    private val prettyGson = GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create()
 
     fun observeDocuments(): Flow<List<DocumentEntity>> = documentDao.observeDocuments()
     fun observeMessages(documentId: Long): Flow<List<ChatMessageEntity>> = documentDao.observeMessages(documentId)
@@ -94,6 +113,19 @@ class DocumentRepository(
         documentDao.deleteExtraction(extractionId)
     }
 
+    suspend fun finishInterruptedGenerations() {
+        documentDao.finishBlankStreamingMessages(
+            """
+            ## 生成已中断
+            - 上一次 AI 生成没有正常结束，可能是本地模型初始化过慢、进程被系统回收，或模型暂不可用。
+            - 本次已停止显示“流式生成中”，请重新发送问题。
+            """.trimIndent()
+        )
+        documentDao.finishPartialStreamingMessages(
+            "\n\n## 生成被中断\n- 上一次生成没有收到结束信号，已自动停止流式状态。"
+        )
+    }
+
     suspend fun renameDocument(documentId: Long, name: String) {
         if (name.isBlank()) return
         documentDao.renameDocument(documentId, name.trim(), "刚刚")
@@ -129,7 +161,7 @@ class DocumentRepository(
             temperature = 0.0
         )
         return runCatching {
-            val answer = qwenApi.chat("Bearer $apiKey", request).choices.firstOrNull()?.message?.content.orEmpty()
+            val answer = qwenContent(qwenApi.chat("Bearer $apiKey", request))
             if (answer.isNotBlank()) "测试通过：Qwen 可用" else "测试失败：接口无返回"
         }.getOrElse { "测试失败：${it.readableMessage()}" }
     }
@@ -142,13 +174,17 @@ class DocumentRepository(
             .toRequestBody("text/plain".toMediaTypeOrNull())
         val part = MultipartBody.Part.createFormData("file", "docpilot-test.txt", body)
         return runCatching {
-            val response = textInApi.parseSync(appId = appId, secretCode = secret, file = part)
-            if (response.result != null || response.code == 200) {
-                "测试通过：TextIn 可连接"
-            } else {
-                "测试失败：${response.message ?: "服务返回 ${response.code}"}"
+            Log.i(TAG, "TextIn credential test start")
+            val response = withTimeout(TEXTIN_TIMEOUT_MS) {
+                textInApi.parseSync(appId = appId, secretCode = secret, file = part)
             }
-        }.getOrElse { "测试失败：${it.readableMessage()}" }
+            parseTextInResponse(response, requireMarkdown = false)
+            Log.i(TAG, "TextIn credential test success")
+            "测试通过：TextIn 可连接"
+        }.getOrElse {
+            Log.e(TAG, "TextIn credential test failed", it)
+            "测试失败：${it.readableMessage()}"
+        }
     }
 
     suspend fun registerImportedDocument(uri: Uri, displayName: String, type: String, sizeLabel: String): Long {
@@ -157,65 +193,96 @@ class DocumentRepository(
                 name = displayName,
                 type = type,
                 sizeLabel = sizeLabel,
-                status = "待解析",
+                status = "已导入，待分析",
                 updatedAt = "刚刚",
                 sourceUri = uri.toString()
             )
         )
     }
 
-    suspend fun parseWithTextIn(documentId: Long, fileName: String, bytes: ByteArray) {
+    suspend fun markDocumentStatus(documentId: Long, status: String, progress: Int? = null) {
+        if (progress == null) {
+            documentDao.updateStatus(documentId, status)
+        } else {
+            documentDao.updateParseProgress(documentId, progress, status)
+        }
+    }
+
+    suspend fun parseWithTextIn(documentId: Long, fileName: String, bytes: ByteArray): ParseOutcome {
         val appId = apiKeyStore.getTextInAppId()
         val secret = apiKeyStore.getTextInSecret()
         val currentDocument = documentDao.getDocument(documentId)
         val safeFallback = localFallbackMarkdown(fileName, bytes, currentDocument?.markdown.orEmpty())
         documentDao.updateParseProgress(documentId, 3, "准备解析")
         if (appId.isBlank() || secret.isBlank()) {
-            val citations = fallbackCitations(fileName, safeFallback)
-            documentDao.updateParsedContent(
-                documentId,
-                safeFallback,
-                documentStructureJson(fileName, safeFallback, citations.size, "本地兜底", citations),
-                citations.size,
-                gson.toJson(citations),
-                100
-            )
+            Log.w(TAG, "TextIn parse skipped: documentId=$documentId file=$fileName reason=missing_credentials")
             documentDao.updateStatus(documentId, "缺少 TextIn Key")
-            return
+            return ParseOutcome(
+                success = false,
+                markdown = "",
+                source = "TextIn",
+                message = "缺少 TextIn app-id 或 secret，未发起 TextIn 调用。"
+            )
         }
 
         documentDao.updateParseProgress(documentId, 8, "TextIn 分析中")
-        runCatching {
+        val parsed = runCatching {
+            Log.i(TAG, "TextIn parse start: documentId=$documentId file=$fileName bytes=${bytes.size}")
             val body = bytes.toRequestBody("application/octet-stream".toMediaTypeOrNull())
             val part = MultipartBody.Part.createFormData("file", fileName, body)
-            textInApi.parseSync(appId = appId, secretCode = secret, file = part)
-        }.onSuccess { response ->
-            documentDao.updateParseProgress(documentId, 70, "整理页级结构")
-            val markdown = response.result?.markdown.orEmpty().ifBlank {
-                safeFallback
+            withTimeout(TEXTIN_TIMEOUT_MS) {
+                parseTextInResponse(textInApi.parseSync(appId = appId, secretCode = secret, file = part))
             }
-            val citations = citationsFromTextIn(fileName, markdown, response.result?.pages.orEmpty())
-            documentDao.updateParsedContent(
-                documentId,
-                markdown,
-                documentStructureJson(fileName, markdown, citations.size, "TextIn xParse", citations),
-                citations.size,
-                gson.toJson(citations),
-                100
-            )
-            documentDao.updateStatus(documentId, "已解析")
-        }.onFailure { error ->
-            val citations = fallbackCitations(fileName, safeFallback)
-            documentDao.updateParsedContent(
-                documentId,
-                safeFallback,
-                documentStructureJson(fileName, safeFallback, citations.size, "本地兜底：${error.readableMessage()}", citations),
-                citations.size,
-                gson.toJson(citations),
-                100
-            )
-            documentDao.updateStatus(documentId, "解析失败")
         }
+        return parsed.fold(
+            onSuccess = { response ->
+                Log.i(TAG, "TextIn parse success: documentId=$documentId markdown=${response.markdown.length} pages=${response.pages.size}")
+                documentDao.updateParseProgress(documentId, 70, "整理页级结构")
+                val markdown = response.markdown.ifBlank {
+                    safeFallback
+                }
+                val parser = if (response.markdown.isBlank()) {
+                    "TextIn xParse（无正文，已保留本地兜底）"
+                } else {
+                    "TextIn xParse"
+                }
+                val citations = citationsFromTextIn(fileName, markdown, response.pages)
+                documentDao.updateParsedContent(
+                    documentId,
+                    markdown,
+                    documentStructureJson(fileName, markdown, citations.size, parser, citations),
+                    citations.size,
+                    gson.toJson(citations),
+                    100
+                )
+                documentDao.updateStatus(documentId, if (response.markdown.isBlank()) "TextIn 无正文" else "已解析")
+                ParseOutcome(
+                    success = response.markdown.isNotBlank(),
+                    markdown = response.markdown,
+                    source = parser,
+                    message = if (response.markdown.isBlank()) "TextIn 已返回，但没有可用正文。" else "TextIn 解析成功。"
+                )
+            },
+            onFailure = { error ->
+                Log.e(TAG, "TextIn parse failed: documentId=$documentId file=$fileName", error)
+                val citations = fallbackCitations(fileName, safeFallback)
+                documentDao.updateParsedContent(
+                    documentId,
+                    safeFallback,
+                    documentStructureJson(fileName, safeFallback, citations.size, "TextIn 失败，已保留本地兜底：${error.readableMessage()}", citations),
+                    citations.size,
+                    gson.toJson(citations),
+                    100
+                )
+                documentDao.updateStatus(documentId, "TextIn 解析失败")
+                ParseOutcome(
+                    success = false,
+                    markdown = "",
+                    source = "TextIn",
+                    message = error.readableMessage()
+                )
+            }
+        )
     }
 
     fun localRuntimeStatus(): String = localModelEngine.runtimeStatus()
@@ -236,16 +303,37 @@ class DocumentRepository(
                 "文档名称：${it.name}\n文档类型：${it.type}\n解析状态：${it.status}\n文件大小：${it.sizeLabel}"
             }.orEmpty()
         }
+        val localContext = compactForLocalAi(usableContext)
         if (!useCloud || apiKey.isBlank()) {
-            val assistantId = documentDao.insertMessage(
-                ChatMessageEntity(documentId = documentId, role = "assistant", content = "", source = "MNN", streaming = true)
-            )
-            val local = localModelEngine.answer(usableContext, question, localConfig) { partial ->
-                documentDao.updateMessageContent(assistantId, partial, streaming = true)
+            return coroutineScope {
+                val assistantId = documentDao.insertMessage(
+                    ChatMessageEntity(documentId = documentId, role = "assistant", content = "", source = "MNN", streaming = true)
+                )
+                var timedOutByWatchdog = false
+                val fallback = aiUnavailableMessage(
+                    title = "暂时无法生成",
+                    reason = "MNN 在 ${LOCAL_AI_TIMEOUT_MS / 1000} 秒内没有返回可用内容。当前本地状态：${localRuntimeStatus()}",
+                    context = localContext
+                )
+                val watchdog = launch {
+                    delay(LOCAL_AI_TIMEOUT_MS)
+                    timedOutByWatchdog = true
+                    documentDao.updateMessageContent(assistantId, fallback, streaming = false)
+                }
+                val local = runCatching {
+                    withTimeout(LOCAL_AI_TIMEOUT_MS) {
+                        localModelEngine.answer(localContext, question, localConfig.copy(maxTokens = minOf(localConfig.maxTokens, 512))) { partial ->
+                            if (!timedOutByWatchdog) {
+                                documentDao.updateMessageContent(assistantId, partial, streaming = true)
+                            }
+                        }
+                    }
+                }.getOrNull()
+                watchdog.cancel()
+                val answer = local ?: fallback
+                documentDao.updateMessageContent(assistantId, answer, streaming = false)
+                answer
             }
-            val answer = local ?: localAnswer(question, usableContext)
-            documentDao.updateMessageContent(assistantId, answer, streaming = false)
-            return answer
         }
 
         val prompt = """
@@ -278,7 +366,7 @@ class DocumentRepository(
             model = cloudModel,
             messages = listOf(
                 QwenMessage(role = "system", content = "你是 DocPilot Qwen 的中文文档研究助手，擅长来源可溯的摘要、问答、结构化抽取和行动建议。回答必须忠于文档、结构清晰、适合手机阅读。"),
-                QwenMessage(role = "user", content = prompt)
+                QwenMessage(role = "user", content = qwenUserContent(prompt, cloudModel, localConfig))
             )
         )
 
@@ -286,19 +374,41 @@ class DocumentRepository(
             ChatMessageEntity(documentId = documentId, role = "assistant", content = "", source = cloudModel, streaming = true)
         )
         val citations = documentDao.getDocument(documentId)?.citationsJson.orEmpty().ifBlank { "[]" }
+        var qwenFailure: Throwable? = null
         val answer = runCatching {
             val buffer = StringBuilder()
             withContext(Dispatchers.IO) {
-                qwenStreamClient.streamChat("Bearer $apiKey", request) { delta ->
-                    buffer.append(delta)
-                    documentDao.updateMessageContent(assistantId, buffer.toString(), streaming = true, citationsJson = citations)
+                withTimeout(AI_TIMEOUT_MS) {
+                    qwenStreamClient.streamChat("Bearer $apiKey", request) { delta ->
+                        buffer.append(delta)
+                        documentDao.updateMessageContent(assistantId, buffer.toString(), streaming = true, citationsJson = citations)
+                    }
                 }
             }
         }.getOrElse {
+            qwenFailure = it
             runCatching {
-                qwenApi.chat("Bearer $apiKey", request).choices.firstOrNull()?.message?.content.orEmpty()
-            }.getOrDefault("")
-        }.ifBlank { localAnswer(question, usableContext) }
+                withTimeout(AI_TIMEOUT_MS) {
+                    qwenContent(qwenApi.chat("Bearer $apiKey", request))
+                }
+            }.onFailure { error -> qwenFailure = error }.getOrDefault("")
+        }.ifBlank {
+            val local = runCatching {
+                withTimeout(LOCAL_AI_TIMEOUT_MS) {
+                    localModelEngine.answer(localContext, question, localConfig.copy(maxTokens = minOf(localConfig.maxTokens, 512)))
+                }
+            }.getOrNull()
+            if (local.isNullOrBlank()) {
+                val reason = qwenFailure?.readableMessage()
+                aiUnavailableMessage(
+                    title = if (reason.isNullOrBlank()) "AI 未生成结果" else "Qwen 调用失败，且 MNN 未生成",
+                    reason = reason?.let { "Qwen 失败原因：$it；本地状态：${localRuntimeStatus()}" } ?: "本地状态：${localRuntimeStatus()}",
+                    context = localContext
+                )
+            } else {
+                local
+            }
+        }
 
         documentDao.updateMessageContent(assistantId, answer, streaming = false, citationsJson = citations)
         return answer
@@ -331,6 +441,24 @@ class DocumentRepository(
         """.trimIndent()
     }
 
+    private fun compactForLocalAi(context: String): String {
+        val normalized = context
+            .replace(Regex("""(?is)<script\b[^>]*>.*?</script>"""), "")
+            .replace(Regex("""(?is)<style\b[^>]*>.*?</style>"""), "")
+            .replace(Regex("""(?is)<[^>]+>"""), " ")
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace(Regex("""[ \t]+"""), " ")
+        val usefulLines = normalized.lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .filterNot { it.length > 240 && it.count { char -> char == '{' || char == '}' || char == ':' || char == ',' } > 20 }
+            .distinct()
+        return usefulLines.joinToString("\n").take(LOCAL_CONTEXT_CHAR_LIMIT)
+    }
+
     suspend fun generateDocumentInsight(
         documentId: Long,
         mode: String,
@@ -339,7 +467,12 @@ class DocumentRepository(
         localConfig: LocalGenerationConfig
     ): String {
         val document = documentDao.getDocument(documentId) ?: return "请先选择一个文档。"
-        val context = document.markdown.ifBlank { localEmptyDocumentMessage(document.name) }
+        val rawContext = document.markdown.ifBlank { localEmptyDocumentMessage(document.name) }
+        val context = if (useCloud) {
+            rawContext.take(CLOUD_CONTEXT_CHAR_LIMIT)
+        } else {
+            compactForLocalAi(rawContext)
+        }
         val prompt = when (mode) {
             "摘要" -> """
                 请生成一份“高信号文档摘要”。
@@ -416,98 +549,12 @@ class DocumentRepository(
         localConfig: LocalGenerationConfig
     ): String {
         val document = documentDao.getDocument(documentId) ?: return "请先选择一个文档。"
-        val textInMarkdown = parseTemplateSourceWithTextIn(documentId, fileName.ifBlank { document.name }, fileBytes)
-        val context = textInMarkdown.ifBlank { document.markdown.ifBlank { localEmptyDocumentMessage(document.name) } }
-        val instruction = when (templateName) {
-            "会议纪要" -> """
-                请按“会议纪要”模板抽取。
-                输出结构：
-                ## 会议基本信息
-                主题、时间、参会方/角色、会议背景；缺失则写“待确认”。
-                ## 关键决策
-                用清单列出已经形成决定的事项，并标注依据。
-                ## 待办事项
-                用表格输出：事项 | 负责人 | 截止时间 | 优先级 | 状态 | 来源。
-                ## 风险与阻塞
-                列出风险、影响、建议跟进动作。
-                ## 下一次跟进
-                给出 3 条以内后续会议或执行建议。
-            """.trimIndent()
-            "合同要点" -> """
-                请按“合同审阅要点”模板抽取。
-                输出结构：
-                ## 基本信息
-                合同名称、编号、甲乙方、金额、期限、生效条件；缺失则写“待确认”。
-                ## 核心条款
-                用表格输出：条款 | 内容摘要 | 权利义务 | 来源。
-                ## 付款与交付
-                输出付款节点、交付物、验收标准、违约处理。
-                ## 风险点
-                重点检查违约责任、知识产权、保密、数据安全、解除条件、争议解决。
-                ## 行动建议
-                给法务/业务/财务分别列出需要确认的问题。
-            """.trimIndent()
-            "论文笔记" -> """
-                请按“论文/研究笔记”模板抽取。
-                输出结构：
-                ## 研究问题
-                ## 方法与数据
-                ## 核心贡献
-                ## 关键结论
-                ## 可引用句
-                ## 局限性与后续研究
-                要求：尽量保留术语、指标、实验对象和来源线索，不要把普通背景写成贡献。
-            """.trimIndent()
-            "表格字段抽取" -> """
-                请按“表格字段抽取”模板处理。
-                输出结构：
-                ## 字段字典
-                用表格输出：字段名 | 类型 | 示例值 | 含义 | 是否需要校验。
-                ## 关键数值
-                抽取金额、比例、日期、数量、状态等字段。
-                ## 异常与缺失
-                标出空值、口径不一致、异常值、单位不清。
-                ## 可导出建议
-                说明适合导出为 CSV/表格的列。
-            """.trimIndent()
-            "自定义提取" -> """
-                请严格按用户自定义要求抽取信息。
-                用户要求：${customInstruction.ifBlank { "用户未填写具体要求，请返回文档中最可结构化的信息。" }}
-                输出结构：
-                ## 提取结果
-                用清单或表格呈现。
-                ## 匹配依据
-                说明结果来自哪些段落、字段或来源。
-                ## 未找到/待确认
-                对未能在文档中找到的项目明确标注“未找到”，不要猜测补全。
-            """.trimIndent()
-            else -> "请抽取文档中的结构化关键信息，输出结论、依据、风险和下一步建议。"
-        }
-        val result = completeWithQwenOrLocal(
-            system = "你是 DocPilot Qwen 的中文文档结构化抽取助手。输出必须准确、可复核、适合手机阅读。不要编造缺失字段；缺失内容统一写“待确认”或“未找到”。",
-            user = """
-                文档名称：${document.name}
-
-                $instruction
-
-                通用要求：
-                - 优先使用 Markdown 表格和短清单。
-                - 尽量标注来源页码、章节、表格或字段。
-                - 对用户可执行的下一步给出明确动作。
-                - 不要输出与模板无关的泛泛说明。
-
-                文档内容：
-                $contentBoundary
-                $context
-                $contentBoundary
-            """.trimIndent(),
-            fallback = if (templateName == "自定义提取") {
-                localCustomTemplateResult(document, customInstruction, context)
-            } else {
-                localTemplateResult(templateName, document)
-            },
-            useCloud = useCloud,
-            cloudModel = cloudModel,
+        val result = extractTemplateWithTextIn(
+            documentId = documentId,
+            templateName = templateName,
+            fileName = fileName.ifBlank { document.name },
+            fileBytes = fileBytes,
+            customInstruction = customInstruction,
             localConfig = localConfig
         )
         insertExtractionIfNew(
@@ -515,12 +562,7 @@ class DocumentRepository(
                 documentId = documentId,
                 templateName = templateName,
                 content = result,
-                source = when {
-                    textInMarkdown.isNotBlank() && hasQwenApiKey() && useCloud -> "TextIn xParse + Qwen"
-                    textInMarkdown.isNotBlank() -> "TextIn xParse"
-                    hasQwenApiKey() && useCloud -> cloudModel
-                    else -> "本地兜底"
-                }
+                source = "TextIn + MNN"
             )
         )
         return result
@@ -542,21 +584,454 @@ class DocumentRepository(
         documentDao.insertMessage(ChatMessageEntity(documentId = documentId, role = "assistant", content = answer, source = source))
     }
 
+    private suspend fun extractTemplateWithTextIn(
+        documentId: Long,
+        templateName: String,
+        fileName: String,
+        fileBytes: ByteArray?,
+        customInstruction: String,
+        localConfig: LocalGenerationConfig
+    ): String {
+        val appId = apiKeyStore.getTextInAppId()
+        val secret = apiKeyStore.getTextInSecret()
+        if (appId.isBlank() || secret.isBlank()) {
+            Log.w(TAG, "TextIn Skill extract skipped: documentId=$documentId template=$templateName reason=missing_credentials")
+            documentDao.updateStatus(documentId, "缺少 TextIn Key")
+            error("缺少 TextIn app-id 或 secret，未发起 TextIn Skill 调用。")
+        }
+        if (fileBytes == null) {
+            Log.w(TAG, "TextIn Skill extract skipped: documentId=$documentId template=$templateName reason=file_read_failed")
+            documentDao.updateStatus(documentId, "读取文件失败")
+            error("无法读取文档文件，未发起 TextIn Skill 调用。")
+        }
+
+        val spec = textInExtractionSpec(templateName, customInstruction)
+        val request = TextInExtractionRequest(
+            file = Base64.encodeToString(fileBytes, Base64.NO_WRAP),
+            prompt = spec.prompt,
+            fields = spec.fields,
+            tableFields = spec.tableFields
+        )
+        Log.i(TAG, "TextIn Skill extract start: documentId=$documentId template=$templateName file=$fileName bytes=${fileBytes.size} fields=${spec.fields.size} tables=${spec.tableFields.size}")
+        return runCatching {
+            val response = withTimeout(TEXTIN_TIMEOUT_MS) {
+                textInApi.extractEntities(appId = appId, secretCode = secret, request = request)
+            }
+            val result = parseTextInExtractionResponse(response)
+            val compact = textInExtractionMarkdown(templateName, result, spec, customInstruction)
+            val markdown = enhanceExtractionWithLocalAi(
+                templateName = templateName,
+                customInstruction = customInstruction,
+                compactExtraction = compact,
+                localConfig = localConfig
+            )
+            documentDao.updateStatus(documentId, "TextIn Skill 已抽取")
+            Log.i(TAG, "TextIn Skill extract success: documentId=$documentId template=$templateName resultChars=${markdown.length}")
+            markdown
+        }.getOrElse { error ->
+            Log.e(TAG, "TextIn Skill extract failed: documentId=$documentId template=$templateName", error)
+            documentDao.updateStatus(documentId, "TextIn Skill 抽取失败")
+            throw error
+        }
+    }
+
+    private fun parseTextInExtractionResponse(response: Response<TextInExtractionResponse>): JsonElement {
+        if (!response.isSuccessful) {
+            val error = response.errorBody()?.string().orEmpty().take(800)
+            error("TextIn Skill HTTP ${response.code()}${error.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+        }
+        val body = response.body() ?: error("TextIn Skill 返回空响应")
+        val okCode = body.code == null || body.code == 0 || body.code == 200
+        if (!okCode) {
+            error("TextIn Skill 服务返回 ${body.code}：${body.message ?: "未知错误"}")
+        }
+        return body.result ?: body.data ?: error("TextIn Skill 未返回 result/data：${body.message ?: "响应中缺少 result/data"}")
+    }
+
+    private suspend fun enhanceExtractionWithLocalAi(
+        templateName: String,
+        customInstruction: String,
+        compactExtraction: String,
+        localConfig: LocalGenerationConfig
+    ): String {
+        val status = localRuntimeStatus()
+        if (status != "MNN 就绪" || !localConfig.enableMnn) {
+            return "$compactExtraction\n\n## 本地 AI 展示\n- 暂时无法生成：$status。已先展示 TextIn 按要求抽取出的字段。"
+        }
+        val prompt = """
+            你是手机端文档抽取结果整理助手。
+            请只基于下方 TextIn 已抽取字段，按用户要求整理为简洁中文 Markdown。
+            不要扩展、不要复述 OCR 坐标、不要输出原始 JSON。
+            如果字段为空或未找到，直接写“未找到”。
+
+            模板：$templateName
+            用户要求：${customInstruction.ifBlank { templateName }}
+
+            TextIn 已抽取字段：
+            $contentBoundary
+            ${compactExtraction.take(LOCAL_EXTRACTION_CONTEXT_LIMIT)}
+            $contentBoundary
+        """.trimIndent()
+        val generated = runCatching {
+            withTimeout(LOCAL_AI_TIMEOUT_MS) {
+                localModelEngine.complete(prompt, localConfig.copy(maxTokens = minOf(localConfig.maxTokens, 512)))
+            }
+        }.getOrNull()
+        return if (generated.isNullOrBlank()) {
+            "$compactExtraction\n\n## 本地 AI 展示\n- 暂时无法生成：$status。已先展示 TextIn 按要求抽取出的字段。"
+        } else {
+            val basis = compactExtraction.lines()
+                .dropWhile { it.startsWith("##") }
+                .joinToString("\n")
+                .trim()
+            "## 本地 AI 展示\n$generated\n\n## TextIn 字段依据\n$basis"
+        }
+    }
+
+    private fun textInExtractionMarkdown(
+        templateName: String,
+        result: JsonElement,
+        spec: TextInExtractionSpec,
+        customInstruction: String
+    ): String {
+        val fieldRows = spec.fields.map { field ->
+            field.name to (findRequestedValue(result, field.name).ifBlank { "未找到" })
+        }
+        val tables = spec.tableFields.mapNotNull { table ->
+            findRequestedTable(result, table)
+        }
+        return buildString {
+            appendLine("## TextIn 抽取结果")
+            appendLine("- 模式：$templateName")
+            appendLine("- 来源：TextIn entity_extraction")
+            if (customInstruction.isNotBlank()) appendLine("- 要求：${customInstruction.toMarkdownCell()}")
+            appendLine()
+            if (fieldRows.isNotEmpty()) {
+                appendLine("## 关键字段")
+                appendLine("| 字段 | 值 |")
+                appendLine("| --- | --- |")
+                fieldRows
+                    .forEach { (key, value) ->
+                        appendLine("| ${key.toMarkdownCell()} | ${value.toMarkdownCell()} |")
+                    }
+                appendLine()
+            }
+            tables.forEach { table ->
+                appendLine("## ${table.title.ifBlank { "明细表" }}")
+                appendLine(table.toMarkdown())
+                appendLine()
+            }
+            appendLine("## 说明")
+            appendLine("- 这里只展示本次模板/自定义要求对应的字段。")
+            appendLine("- TextIn 返回的 OCR 坐标、版面块和底层结构已隐藏。")
+        }.trim()
+    }
+
+    private data class TextInMarkdownTable(
+        val title: String,
+        val headers: List<String>,
+        val rows: List<List<String>>
+    )
+
+    private fun TextInMarkdownTable.toMarkdown(): String = buildString {
+        appendLine("| ${headers.joinToString(" | ") { it.toMarkdownCell() }} |")
+        appendLine("| ${headers.joinToString(" | ") { "---" }} |")
+        rows.take(MAX_TEXTIN_TABLE_ROWS).forEach { row ->
+            appendLine("| ${row.joinToString(" | ") { it.toMarkdownCell() }} |")
+        }
+        if (rows.size > MAX_TEXTIN_TABLE_ROWS) {
+            val hidden = rows.size - MAX_TEXTIN_TABLE_ROWS
+            val summary = List(headers.size) { index ->
+                when (index) {
+                    0 -> "更多"
+                    1 -> "已隐藏 $hidden 行，请查看原始 JSON"
+                    else -> ""
+                }
+            }
+            appendLine("| ${summary.joinToString(" | ") { it.toMarkdownCell() }} |")
+        }
+    }
+
+    private fun findRequestedValue(element: JsonElement?, fieldName: String): String {
+        if (element == null || element.isJsonNull) return ""
+        val target = fieldName.normalizedFieldName()
+        fun search(node: JsonElement?): String? {
+            if (node == null || node.isJsonNull) return null
+            if (node.isJsonObject) {
+                val obj = node.asJsonObject
+                obj.entrySet().firstOrNull { (key, _) -> key.normalizedFieldName() == target }?.let { (_, value) ->
+                    return value.cellValue().takeIfUseful()
+                }
+                val label = firstStringValue(obj, "name", "key", "field", "field_name", "title", "label")
+                if (label?.normalizedFieldName() == target) {
+                    listOf("value", "text", "content", "result", "answer").forEach { key ->
+                        obj.get(key)?.cellValue()?.takeIfUseful()?.let { return it }
+                    }
+                    return obj.entrySet()
+                        .filterNot { it.key in setOf("name", "key", "field", "field_name", "title", "label") }
+                        .joinToString("；") { (key, value) -> "$key：${value.cellValue()}" }
+                        .takeIfUseful()
+                }
+                obj.entrySet().forEach { (_, value) ->
+                    search(value)?.let { return it }
+                }
+            }
+            if (node.isJsonArray) {
+                node.asJsonArray.forEach { item ->
+                    search(item)?.let { return it }
+                }
+            }
+            return null
+        }
+        return search(element).orEmpty()
+    }
+
+    private fun findRequestedTable(element: JsonElement?, table: TextInExtractionTable): TextInMarkdownTable? {
+        if (element == null || element.isJsonNull) return null
+        val headers = table.fields.map { it.name }
+        val targetTitle = table.title.normalizedFieldName()
+        fun search(node: JsonElement?, path: String): TextInMarkdownTable? {
+            if (node == null || node.isJsonNull) return null
+            if (node.isJsonObject) {
+                node.asJsonObject.entrySet().forEach { (key, value) ->
+                    search(value, if (path.isBlank()) key else "$path.$key")?.let { return it }
+                }
+            }
+            if (node.isJsonArray) {
+                val objects = node.asJsonArray.mapNotNull { item -> item.takeIf { it.isJsonObject }?.asJsonObject }
+                if (objects.isNotEmpty() && objects.size == node.asJsonArray.size()) {
+                    val pathMatches = path.normalizedFieldName().contains(targetTitle)
+                    val overlap = objects
+                        .flatMap { obj -> obj.entrySet().map { it.key.normalizedFieldName() } }
+                        .distinct()
+                        .count { key -> headers.any { header -> header.normalizedFieldName() == key } }
+                    if (pathMatches || overlap > 0) {
+                        val rows = objects.map { obj ->
+                            headers.map { header -> findRequestedValue(obj, header).ifBlank { "未找到" } }
+                        }.filter { row -> row.any { it != "未找到" } }
+                        if (rows.isNotEmpty()) {
+                            return TextInMarkdownTable(table.title, headers, rows)
+                        }
+                    }
+                }
+                node.asJsonArray.forEachIndexed { index, item ->
+                    search(item, "$path[$index]")?.let { return it }
+                }
+            }
+            return null
+        }
+        return search(element, "")
+    }
+
+    private fun collectScalarRows(element: JsonElement?, path: String, rows: MutableList<Pair<String, String>>) {
+        if (element == null || element.isJsonNull) return
+        when {
+            element.isJsonPrimitive -> {
+                val label = path.ifBlank { "result" }
+                rows += label.cleanTextInPath() to element.asString
+            }
+            element.isJsonArray -> {
+                val array = element.asJsonArray
+                if (array.all { it.isJsonPrimitive || it.isJsonNull }) {
+                    val value = array.joinToString("；") { if (it.isJsonNull) "未找到" else it.asString }
+                    rows += path.cleanTextInPath() to value
+                } else {
+                    array.forEachIndexed { index, item ->
+                        collectScalarRows(item, "$path[$index]", rows)
+                    }
+                }
+            }
+            element.isJsonObject -> {
+                element.asJsonObject.entrySet().forEach { (key, value) ->
+                    val nextPath = if (path.isBlank()) key else "$path.$key"
+                    collectScalarRows(value, nextPath, rows)
+                }
+            }
+        }
+    }
+
+    private fun collectObjectArrayTables(element: JsonElement?, path: String, tables: MutableList<TextInMarkdownTable>) {
+        if (element == null || element.isJsonNull) return
+        when {
+            element.isJsonObject -> {
+                element.asJsonObject.entrySet().forEach { (key, value) ->
+                    val nextPath = if (path.isBlank()) key else "$path.$key"
+                    collectObjectArrayTables(value, nextPath, tables)
+                }
+            }
+            element.isJsonArray -> {
+                val objects = element.asJsonArray.mapNotNull { it.takeIf { item -> item.isJsonObject }?.asJsonObject }
+                if (objects.isNotEmpty() && objects.size == element.asJsonArray.size()) {
+                    val headers = objects
+                        .flatMap { it.entrySet().map { entry -> entry.key } }
+                        .distinct()
+                        .take(MAX_TEXTIN_TABLE_COLUMNS)
+                    if (headers.isNotEmpty()) {
+                        val rows = objects.map { obj ->
+                            headers.map { header -> obj.get(header).cellValue() }
+                        }
+                        tables += TextInMarkdownTable(path.cleanTextInPath(), headers, rows)
+                    }
+                }
+                element.asJsonArray.forEachIndexed { index, item ->
+                    collectObjectArrayTables(item, "$path[$index]", tables)
+                }
+            }
+        }
+    }
+
+    private fun JsonElement?.cellValue(): String {
+        if (this == null || isJsonNull) return "未找到"
+        return when {
+            isJsonPrimitive -> asString
+            isJsonArray -> asJsonArray.joinToString("；") { it.cellValue() }
+            isJsonObject -> {
+                val obj = asJsonObject
+                firstStringValue(obj, "value", "text", "content", "name", "result")
+                    ?: prettyGson.toJson(this)
+            }
+            else -> toString()
+        }
+    }
+
+    private fun firstStringValue(obj: JsonObject, vararg keys: String): String? {
+        return keys.firstNotNullOfOrNull { key ->
+            obj.get(key)?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun String.cleanTextInPath(): String {
+        return trim('.')
+            .replace("result.", "")
+            .replace("details.", "")
+            .replace(".row", "")
+            .replace("row.", "")
+            .ifBlank { "result" }
+    }
+
+    private fun String.normalizedFieldName(): String {
+        return lowercase()
+            .replace(Regex("""[\s_:\-：，,。/\\|（）()\[\]{}"'`]+"""), "")
+    }
+
+    private fun String.takeIfUseful(): String? {
+        val value = trim()
+        if (value.isBlank()) return null
+        if (value.equals("null", ignoreCase = true)) return null
+        if (value == "{}" || value == "[]") return null
+        return value
+    }
+
+    private fun String.toMarkdownCell(): String {
+        val compact = replace("\r", " ")
+            .replace("\n", " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .ifBlank { "未找到" }
+        val clipped = if (compact.length > MAX_TEXTIN_CELL_CHARS) {
+            compact.take(MAX_TEXTIN_CELL_CHARS) + "..."
+        } else {
+            compact
+        }
+        return clipped.replace("|", "\\|")
+    }
+
+    private data class TextInExtractionSpec(
+        val prompt: String,
+        val fields: List<TextInExtractionField>,
+        val tableFields: List<TextInExtractionTable> = emptyList()
+    )
+
+    private fun textInExtractionSpec(templateName: String, customInstruction: String): TextInExtractionSpec {
+        fun fields(vararg names: String): List<TextInExtractionField> = names.map { TextInExtractionField(it, "请从文档中提取“$it”，未找到则返回未找到。") }
+        fun table(title: String, vararg names: String): TextInExtractionTable =
+            TextInExtractionTable(title = title, fields = fields(*names), description = "请按行提取$title，保留原文可核验信息。")
+        return when (templateName) {
+            "发票信息提取" -> TextInExtractionSpec(
+                prompt = "请提取发票关键字段、交易双方、金额税额和明细项目。未找到字段写未找到，不要猜测。",
+                fields = fields(
+                    "发票类型", "发票代码", "发票号码", "开票日期", "校验码", "机器编号",
+                    "购买方名称", "购买方纳税人识别号", "销售方名称", "销售方纳税人识别号",
+                    "合计金额", "合计税额", "价税合计", "备注"
+                ),
+                tableFields = listOf(table("发票明细", "名称", "规格型号", "单位", "数量", "单价", "金额", "税率", "税额"))
+            )
+            "会议纪要" -> TextInExtractionSpec(
+                prompt = "请提取会议纪要中的主题、时间、参会方、关键决策、待办事项、风险与阻塞。",
+                fields = fields("会议主题", "会议时间", "参会方", "会议背景", "关键决策", "风险与阻塞", "下一步跟进"),
+                tableFields = listOf(table("待办事项", "事项", "负责人", "截止时间", "优先级", "状态", "来源"))
+            )
+            "合同要点" -> TextInExtractionSpec(
+                prompt = "请提取合同审阅要点。缺失字段写未找到，不要补全。",
+                fields = fields("合同名称", "合同编号", "甲方", "乙方", "合同金额", "合同期限", "生效条件", "付款节点", "交付物", "违约责任", "争议解决", "风险点"),
+                tableFields = listOf(table("核心条款", "条款", "内容摘要", "权利义务", "来源"))
+            )
+            "论文笔记" -> TextInExtractionSpec(
+                prompt = "请提取论文或研究文档中的研究问题、方法、数据、贡献、结论、可引用句、局限性。",
+                fields = fields("研究问题", "方法与数据", "核心贡献", "关键结论", "可引用句", "局限性", "后续研究")
+            )
+            "表格字段抽取" -> TextInExtractionSpec(
+                prompt = "请从文档表格中提取字段字典、关键数值、异常与缺失信息。",
+                fields = fields("字段字典", "关键数值", "异常值", "缺失值", "单位", "日期", "金额", "比例"),
+                tableFields = listOf(table("可导出表格", "字段名", "类型", "示例值", "含义", "是否需要校验"))
+            )
+            "自定义提取" -> TextInExtractionSpec(
+                prompt = """
+                    请严格按照用户要求提取字段，只返回用户要求的信息。
+                    不要返回 OCR 坐标、版面块、全文、无关字段或模型解释。
+                    未找到的字段写未找到，不要猜测。
+                    用户要求：${customInstruction.ifBlank { "提取文档中最重要的结构化信息" }}
+                """.trimIndent(),
+                fields = customExtractionFields(customInstruction)
+            )
+            else -> TextInExtractionSpec(
+                prompt = "请提取文档中的结构化关键信息，未找到字段写未找到。",
+                fields = fields("主题", "关键信息", "金额", "日期", "主体", "风险点", "待办")
+            )
+        }
+    }
+
+    private fun customExtractionFields(customInstruction: String): List<TextInExtractionField> {
+        val cleaned = customInstruction
+            .replace("请", "")
+            .replace("帮我", "")
+            .replace("提取", "")
+            .replace("抽取", "")
+            .replace("字段", "")
+            .replace("信息", "")
+        val candidates = cleaned
+            .split("、", "，", ",", "；", ";", "\n", "和", "及", "以及")
+            .map { it.trim().trim(':', '：', '.', '。', '-', ' ') }
+            .filter { it.length in 2..24 }
+            .filterNot { it.contains("不要") || it.contains("只") && it.length > 12 }
+            .distinct()
+            .take(12)
+        val names = candidates.ifEmpty { listOf("提取结果", "匹配依据", "未找到或待确认") }
+        return names.map { name ->
+            TextInExtractionField(
+                name = name,
+                description = "只提取“$name”对应的内容。未找到则返回未找到，不要输出无关正文、OCR 坐标或版面结构。"
+            )
+        }
+    }
+
     private suspend fun parseTemplateSourceWithTextIn(documentId: Long, fileName: String, fileBytes: ByteArray?): String {
         val appId = apiKeyStore.getTextInAppId()
         val secret = apiKeyStore.getTextInSecret()
-        if (appId.isBlank() || secret.isBlank() || fileBytes == null) return ""
+        if (appId.isBlank() || secret.isBlank()) error("缺少 TextIn app-id 或 secret，未发起 TextIn 调用。")
+        if (fileBytes == null) error("无法读取文档文件，未发起 TextIn 调用。")
 
-        val response = runCatching {
-            val body = fileBytes.toRequestBody("application/octet-stream".toMediaTypeOrNull())
-            val part = MultipartBody.Part.createFormData("file", fileName, body)
-            textInApi.parseSync(appId = appId, secretCode = secret, file = part)
-        }.getOrNull() ?: return ""
+        val body = fileBytes.toRequestBody("application/octet-stream".toMediaTypeOrNull())
+        val part = MultipartBody.Part.createFormData("file", fileName, body)
+        Log.i(TAG, "TextIn template parse start: documentId=$documentId file=$fileName bytes=${fileBytes.size}")
+        val response = withTimeout(TEXTIN_TIMEOUT_MS) {
+            parseTextInResponse(textInApi.parseSync(appId = appId, secretCode = secret, file = part))
+        }
 
         val current = documentDao.getDocument(documentId)
-        val parsedMarkdown = response.result?.markdown.orEmpty()
+        val parsedMarkdown = response.markdown
         if (parsedMarkdown.isNotBlank()) {
-            val citations = citationsFromTextIn(fileName, parsedMarkdown, response.result?.pages.orEmpty())
+            val citations = citationsFromTextIn(fileName, parsedMarkdown, response.pages)
             documentDao.updateParsedContent(
                 documentId,
                 parsedMarkdown,
@@ -572,6 +1047,14 @@ class DocumentRepository(
         return parsedMarkdown
     }
 
+    private fun localTemplateWithTextInError(error: Throwable?, fallback: String): String {
+        return if (error == null) {
+            fallback
+        } else {
+            "## TextIn 解析未完成\n- 失败原因：${error.readableMessage()}\n- 已继续使用当前本地可用内容生成结果。\n\n$fallback"
+        }
+    }
+
     private suspend fun completeWithQwenOrLocal(
         system: String,
         user: String,
@@ -580,21 +1063,195 @@ class DocumentRepository(
         cloudModel: String,
         localConfig: LocalGenerationConfig
     ): String {
-        if (!useCloud) return localModelEngine.complete("$system\n\n$user", localConfig) ?: fallback
+        if (!useCloud) {
+            return runCatching {
+                withTimeout(AI_TIMEOUT_MS) {
+                    localModelEngine.complete("$system\n\n$user", localConfig)
+                }
+            }.getOrNull()
+                ?: "## MNN 未生成\n- 当前本地状态：${localRuntimeStatus()}\n- 本次没有返回固定模板结果，请下载/选择可用 MNN 模型后重试。"
+        }
         val apiKey = apiKeyStore.getQwenApiKey()
-        if (apiKey.isBlank()) return localModelEngine.complete("$system\n\n$user", localConfig) ?: fallback
+        if (apiKey.isBlank()) {
+            return runCatching {
+                withTimeout(AI_TIMEOUT_MS) {
+                    localModelEngine.complete("$system\n\n$user", localConfig)
+                }
+            }.getOrNull()
+                ?: "## 未配置 Qwen API，MNN 未生成\n- 当前本地状态：${localRuntimeStatus()}\n- 本次没有返回固定模板结果。"
+        }
         val request = QwenChatRequest(
             model = cloudModel,
             messages = listOf(
                 QwenMessage(role = "system", content = system),
-                QwenMessage(role = "user", content = user)
+                QwenMessage(role = "user", content = qwenUserContent(user, cloudModel, localConfig))
             ),
             temperature = 0.2
         )
+        var qwenFailure: Throwable? = null
         return runCatching {
-            qwenApi.chat("Bearer $apiKey", request).choices.firstOrNull()?.message?.content.orEmpty()
-        }.getOrDefault("").ifBlank { localModelEngine.complete("$system\n\n$user", localConfig) ?: fallback }
+            withTimeout(AI_TIMEOUT_MS) {
+                qwenContent(qwenApi.chat("Bearer $apiKey", request))
+            }
+        }.onFailure {
+            qwenFailure = it
+        }.getOrDefault("").ifBlank {
+            runCatching {
+                withTimeout(AI_TIMEOUT_MS) {
+                    localModelEngine.complete("$system\n\n$user", localConfig)
+                }
+            }.getOrNull()
+                ?: qwenFailure?.let { "## 云端 Qwen 调用失败，且 MNN 未生成\n- 失败原因：${it.readableMessage()}\n- 当前本地状态：${localRuntimeStatus()}\n- 本次没有返回固定模板结果。" }
+                ?: "## AI 未生成结果\n- 当前本地状态：${localRuntimeStatus()}"
+        }
     }
+
+    private fun aiUnavailableMessage(title: String, reason: String, context: String): String {
+        val snippets = context.lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .take(8)
+            .joinToString("\n") { "- ${it.take(120)}" }
+        return """
+            ## $title
+            - $reason
+            - 本次没有返回固定模板回答，请先确认云端 Qwen 或本地 MNN 模型可用。
+
+            ## 当前文档片段
+            ${snippets.ifBlank { "- 暂无可用文档内容。" }}
+        """.trimIndent()
+    }
+
+    private fun qwenContent(response: Response<QwenChatResponse>): String {
+        if (!response.isSuccessful) {
+            val error = response.errorBody()?.string().orEmpty().take(600)
+            error("Qwen HTTP ${response.code()}${error.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+        }
+        val body = response.body() ?: error("Qwen 返回空响应")
+        return body.choices.firstOrNull()?.message?.content.qwenText()
+    }
+
+    private fun Any?.qwenText(): String {
+        return when (this) {
+            null -> ""
+            is String -> this
+            is List<*> -> this.joinToString("") { item ->
+                val map = item as? Map<*, *> ?: return@joinToString ""
+                (map["text"] ?: map["content"]).qwenText()
+            }
+            is Map<*, *> -> (this["text"] ?: this["content"]).qwenText()
+            else -> toString()
+        }
+    }
+
+    private fun qwenUserContent(prompt: String, model: String, localConfig: LocalGenerationConfig): Any {
+        if (!model.contains("vl", ignoreCase = true) || localConfig.imagePaths.isEmpty()) {
+            return prompt
+        }
+        val images = localConfig.imagePaths.mapNotNull { path ->
+            imageDataUrl(path)?.let { dataUrl ->
+                mapOf("type" to "image_url", "image_url" to mapOf("url" to dataUrl))
+            }
+        }
+        if (images.isEmpty()) return prompt
+        return listOf(mapOf("type" to "text", "text" to prompt)) + images
+    }
+
+    private fun imageDataUrl(path: String): String? {
+        val file = File(path)
+        if (!file.isFile) return null
+        val mime = when (file.extension.lowercase()) {
+            "jpg", "jpeg" -> "image/jpeg"
+            "webp" -> "image/webp"
+            "bmp" -> "image/bmp"
+            else -> "image/png"
+        }
+        val encoded = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+        return "data:$mime;base64,$encoded"
+    }
+
+    private fun parseTextInResponse(
+        response: Response<TextInParseResponse>,
+        requireMarkdown: Boolean = true
+    ): TextInParsedResult {
+        if (!response.isSuccessful) {
+            val error = response.errorBody()?.string().orEmpty().take(600)
+            error("TextIn HTTP ${response.code()}${error.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+        }
+        val body = response.body() ?: error("TextIn 返回空响应")
+        val payload = body.result ?: body.data
+        val markdown = payload.markdownContent()
+        val okCode = body.code == null || body.code == 0 || body.code == 200
+        if (!okCode) {
+            error("TextIn 服务返回 ${body.code}：${body.message ?: "未知错误"}")
+        }
+        if (requireMarkdown && markdown.isBlank() && payload == null) {
+            error("TextIn 未返回解析结果：${body.message ?: "响应中缺少 result/data"}")
+        }
+        return TextInParsedResult(
+            markdown = markdown,
+            pages = payload?.pages.orEmpty(),
+            pageCount = payload?.pageCount ?: payload?.pages?.size ?: 0
+        )
+    }
+
+    private fun TextInParseResult?.markdownContent(): String {
+        return this?.markdown?.takeIf { it.isNotBlank() }
+            ?: this?.md?.takeIf { it.isNotBlank() }
+            ?: this?.text?.takeIf { it.isNotBlank() }
+            ?: this?.content?.takeIf { it.isNotBlank() }
+            ?: this?.pages.pageMarkdownContent()
+            ?: ""
+    }
+
+    private fun List<Map<String, Any>>?.pageMarkdownContent(): String? {
+        if (this.isNullOrEmpty()) return null
+        val pages = mapIndexedNotNull { index, page ->
+            val text = page.textInPageText()
+            if (text.isBlank()) {
+                null
+            } else {
+                val pageNo = page.numberValue("page")
+                    ?: page.numberValue("page_id")?.plus(1)
+                    ?: page.numberValue("pageIndex")?.plus(1)
+                    ?: index + 1
+                "## 第 ${pageNo} 页\n\n$text"
+            }
+        }
+        return pages.joinToString("\n\n").takeIf { it.isNotBlank() }
+    }
+
+    private fun Map<String, Any>.textInPageText(): String {
+        val directKeys = listOf("markdown", "md", "text", "content", "page_content", "pageContent")
+        directKeys.firstNotNullOfOrNull { key ->
+            this[key]?.textInTextValue()
+        }?.let { return it }
+        val nestedKeys = listOf("result", "data", "blocks", "lines", "paragraphs", "tables")
+        return nestedKeys.mapNotNull { key ->
+            this[key]?.textInTextValue()
+        }.joinToString("\n").trim()
+    }
+
+    private fun Any?.textInTextValue(): String? {
+        return when (this) {
+            null -> null
+            is String -> takeIf { it.isNotBlank() }
+            is Map<*, *> -> {
+                val directKeys = listOf("markdown", "md", "text", "content", "value")
+                directKeys.firstNotNullOfOrNull { key ->
+                    this[key]?.textInTextValue()
+                } ?: values.mapNotNull { it.textInTextValue() }.joinToString("\n").takeIf { it.isNotBlank() }
+            }
+            is List<*> -> mapNotNull { it.textInTextValue() }.joinToString("\n").takeIf { it.isNotBlank() }
+            else -> toString().takeIf { it.isNotBlank() }
+        }
+    }
+
+    private data class TextInParsedResult(
+        val markdown: String,
+        val pages: List<Map<String, Any>>,
+        val pageCount: Int
+    )
 
     private fun localInsight(mode: String, document: DocumentEntity): String {
         val text = document.markdown.ifBlank { localEmptyDocumentMessage(document.name) }
@@ -610,14 +1267,22 @@ class DocumentRepository(
     }
 
     private fun localTemplateResult(templateName: String, document: DocumentEntity): String {
-        val base = "文档：${document.name}"
-        return when (templateName) {
-            "会议纪要" -> "$base\n\n## 会议纪要\n- 主题：待从文档确认\n- 关键决策：请复核解析内容中的决议类语句\n- 待办：补充负责人、截止时间、验收标准\n\n## 复核建议\n- 优先确认决策是否已有责任人和时间点。"
-            "合同要点" -> "$base\n\n## 合同要点\n- 合同主体：待复核\n- 金额/期限：请检查金额、日期、付款节点\n- 风险点：违约责任、知识产权、数据安全、保密条款\n\n## 复核建议\n- 对金额、期限、违约和争议解决条款做人工确认。"
-            "论文笔记" -> "$base\n\n## 论文笔记\n- 研究问题：待提炼\n- 方法：请结合摘要/方法章节复核\n- 贡献与局限：建议配置 Qwen API 后自动生成\n\n## 复核建议\n- 区分作者结论、实验结果和背景介绍。"
-            "表格字段抽取" -> "$base\n\n## 表格字段\n| 字段 | 状态 | 建议 |\n| --- | --- | --- |\n| 字段名 | 待识别 | 检查表头 |\n| 数值范围 | 待校验 | 核对单位和异常值 |\n| 缺失值 | 待检查 | 导出后复核 |\n\n## 复核建议\n- 导出前核对单位、日期格式和空值。"
-            else -> "$base\n\n已生成本地抽取结果。"
-        }
+        val snippets = document.markdown.lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() && !it.startsWith("| ---") }
+            .take(8)
+            .joinToString("\n") { "- ${it.take(120)}" }
+        return """
+            ## $templateName 未完成 AI 抽取
+            - TextIn 解析内容已保存到文档，但当前没有可用的云端 Qwen 或 MNN 生成结果。
+            - 为避免返回固定模板误导用户，本次不伪造抽取结论。
+
+            ## 可复核片段
+            ${snippets.ifBlank { "- 当前文档暂无可用正文片段。" }}
+
+            ## 下一步
+            - 开启云端增强并确认 Qwen API 测试通过，或在设置中下载并选择可用 MNN 模型后重试。
+        """.trimIndent()
     }
 
     private fun localCustomTemplateResult(document: DocumentEntity, customInstruction: String, context: String): String {
@@ -769,6 +1434,18 @@ class DocumentRepository(
     )
 
     companion object {
+        private const val TAG = "DocPilot"
+        private const val TEXTIN_TIMEOUT_MS = 120_000L
+        private const val AI_TIMEOUT_MS = 180_000L
+        private const val LOCAL_AI_TIMEOUT_MS = 45_000L
+        private const val LOCAL_CONTEXT_CHAR_LIMIT = 6_000
+        private const val LOCAL_EXTRACTION_CONTEXT_LIMIT = 4_000
+        private const val CLOUD_CONTEXT_CHAR_LIMIT = 30_000
+        private const val MAX_TEXTIN_DISPLAY_ROWS = 120
+        private const val MAX_TEXTIN_DISPLAY_TABLES = 4
+        private const val MAX_TEXTIN_TABLE_ROWS = 40
+        private const val MAX_TEXTIN_TABLE_COLUMNS = 10
+        private const val MAX_TEXTIN_CELL_CHARS = 220
         private const val contentBoundary = "-----DOC_CONTENT-----"
         private val REAL_CASES = listOf(
             RealCase(
@@ -1032,3 +1709,9 @@ class DocumentRepository(
         const val SAMPLE_JSON = """{"pages":[{"page":12,"title":"行业增长驱动因素"}]}"""
     }
 }
+    data class ParseOutcome(
+        val success: Boolean,
+        val markdown: String,
+        val source: String,
+        val message: String
+    )

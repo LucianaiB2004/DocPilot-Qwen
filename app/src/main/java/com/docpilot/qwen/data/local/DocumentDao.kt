@@ -90,6 +90,12 @@ interface DocumentDao {
     @Query("UPDATE chat_messages SET content = :content, streaming = :streaming, citationsJson = :citationsJson WHERE id = :id")
     suspend fun updateMessageContent(id: Long, content: String, streaming: Boolean, citationsJson: String = "[]")
 
+    @Query("UPDATE chat_messages SET content = :fallback, streaming = 0 WHERE streaming = 1 AND TRIM(content) = ''")
+    suspend fun finishBlankStreamingMessages(fallback: String)
+
+    @Query("UPDATE chat_messages SET content = content || :suffix, streaming = 0 WHERE streaming = 1 AND TRIM(content) != ''")
+    suspend fun finishPartialStreamingMessages(suffix: String)
+
     @Query("DELETE FROM chat_messages")
     suspend fun deleteMessages()
 

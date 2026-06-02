@@ -38,7 +38,7 @@ class MnnQwenEngine(
 
     override fun runtimeStatus(): String {
         return when {
-            !MnnLlmNative.isRuntimeLoadable -> "MNN 运行库未安装"
+            !MnnLlmNative.isRuntimeLoadable -> "MNN 原生推理暂不可用"
             selectedConfigFile() == null -> "未选择 MNN 模型包"
             else -> "MNN 就绪"
         }
@@ -104,7 +104,7 @@ class MnnQwenEngine(
                 backendType = config.backendType,
                 precision = config.precision,
                 maxTokens = config.maxTokens,
-                imagePaths = config.imagePaths,
+                imagePaths = config.imagePaths.takeIf { modelManager.selectedModel().contains("VL", ignoreCase = true) }.orEmpty(),
                 onPartial = onPartial
             )
         }?.takeIf { it.isNotBlank() }
@@ -128,15 +128,14 @@ class MnnQwenEngine(
 }
 
 object MnnLlmNative {
+    private const val ENABLE_NATIVE_MNN = false
+
     val isRuntimeLoadable: Boolean by lazy {
+        if (!ENABLE_NATIVE_MNN) return@lazy false
         runCatching {
             System.loadLibrary("c++_shared")
             System.loadLibrary("MNN")
-            runCatching {
-                System.loadLibrary("docpilot_mnn_llm")
-            }.getOrElse {
-                System.loadLibrary("mnnllmapp")
-            }
+            System.loadLibrary("docpilot_mnn_llm")
         }.isSuccess
     }
 

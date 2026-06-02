@@ -1,5 +1,7 @@
 package com.docpilot.qwen.data.network
 
+import com.google.gson.annotations.SerializedName
+import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.Header
 import retrofit2.http.POST
@@ -9,18 +11,19 @@ interface QwenApi {
     suspend fun chat(
         @Header("Authorization") authorization: String,
         @Body request: QwenChatRequest
-    ): QwenChatResponse
+    ): Response<QwenChatResponse>
 }
 
 data class QwenChatRequest(
     val model: String,
     val messages: List<QwenMessage>,
-    val temperature: Double = 0.2
+    val temperature: Double = 0.2,
+    @SerializedName("max_tokens") val maxTokens: Int? = null
 )
 
 data class QwenMessage(
     val role: String,
-    val content: String
+    val content: Any
 )
 
 data class QwenChatResponse(
@@ -28,6 +31,13 @@ data class QwenChatResponse(
 )
 
 data class QwenChoice(
-    val message: QwenMessage
+    val message: QwenResponseMessage? = null,
+    val delta: QwenResponseMessage? = null
+)
+
+data class QwenResponseMessage(
+    val role: String? = null,
+    val content: Any? = null,
+    @SerializedName("reasoning_content") val reasoningContent: String? = null
 )
 

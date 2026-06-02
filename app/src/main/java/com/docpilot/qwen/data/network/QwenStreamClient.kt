@@ -32,7 +32,10 @@ class QwenStreamClient(
 
         val full = StringBuilder()
         client.newCall(httpRequest).execute().use { response ->
-            if (!response.isSuccessful) error("Qwen stream failed: HTTP ${response.code}")
+            if (!response.isSuccessful) {
+                val errorText = response.body?.string().orEmpty().take(600)
+                error("Qwen stream failed: HTTP ${response.code}${errorText.takeIf { it.isNotBlank() }?.let { " - $it" }.orEmpty()}")
+            }
             val source = response.body?.source() ?: return ""
             while (!source.exhausted()) {
                 val line = source.readUtf8Line() ?: break
@@ -53,9 +56,17 @@ class QwenStreamClient(
         return runCatching {
             val root = gson.fromJson(data, JsonObject::class.java)
             val choice = root.getAsJsonArray("choices")?.firstOrNull()?.asJsonObject ?: return@runCatching ""
-            choice.getAsJsonObject("delta")?.get("content")?.asString
-                ?: choice.getAsJsonObject("message")?.get("content")?.asString
-                ?: ""
+            val payload = choice.getAsJsonObject("delta") ?: choice.getAsJsonObject("message") ?: return@runCatching ""
+            payload.get("content")?.let { content ->
+                when {
+                    content.isJsonNull -> ""
+                    content.isJsonPrimitive -> content.asString
+                    content.isJsonArray -> content.asJsonArray.joinToString("") { item ->
+                        item.asJsonObject?.get("text")?.asString.orEmpty()
+                    }
+                    else -> ""
+                }
+            } ?: ""
         }.getOrDefault("")
     }
 
