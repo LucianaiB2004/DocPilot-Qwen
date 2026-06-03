@@ -633,7 +633,12 @@ class DocPilotViewModel(
                     "## $mode 生成失败\n- 异常：${it.message ?: it::class.java.simpleName}\n- 请稍后重试，或先检查云端/API/本地模型设置。"
                 }
                 insightResults.value = insightResults.value + (resultKey to result)
-                repository.appendAssistantExchange(doc.id, prompt, result, if (cloudEnabled.value) cloudModel.value else "本地规则")
+                val source = when {
+                    cloudEnabled.value -> cloudModel.value
+                    repository.localRuntimeStatus() == "MNN 就绪" -> "MNN"
+                    else -> "本地规则"
+                }
+                repository.appendAssistantExchange(doc.id, prompt, result, source)
                 status.value = "$mode 已生成"
             } finally {
                 workingTask.value = ""

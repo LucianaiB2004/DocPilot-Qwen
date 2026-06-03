@@ -1,11 +1,11 @@
 # DocPilotQwen 1.0.0 Debug 更新包
 
-生成时间：2026-05-28  
-包名：`com.docpilot.qwen`  
-版本：`1.0.0` / `versionCode 1`  
-文件：`DocPilotQwen-1.0.0-debug.apk`  
-大小：`34,406,799 bytes`  
-SHA-256：`1CD673F9C9182DDD0E9B11CE756E26549E81E47B44A088433663A3DFD92C3685`
+生成时间：2026-06-03
+包名：`com.docpilot.qwen`
+版本：`1.0.0` / `versionCode 1`
+文件：`DocPilotQwen-1.0.0-debug.apk`
+大小：`34,152,436 bytes`
+SHA-256：`63B5FFEFE6498A4BBB6B2E6D709F644748B815EDC97A1FC1EA7B99AA21E3A0D5`
 
 ## 本包包含
 
@@ -39,6 +39,10 @@ SHA-256：`1CD673F9C9182DDD0E9B11CE756E26549E81E47B44A088433663A3DFD92C3685`
 - 修复 AI 助手发送问题时异常静默、界面像卡住的问题。
 - 优化 AI 助手文档问答区域、入口状态和模型设置页面展示。
 - 精简 README，补充背景、技术栈、使用方法和 APK 内容说明。
+- 修复 MNN 本地推理 JNI 调用签名，恢复真实 MNN 会话初始化与提交。
+- 启用 Qwen MNN 模型包配置合并、mmap 缓存和本地输出清理。
+- AI 助手在 MNN 可用时显示 `MNN 本地`，生成记录来源标记为 `MNN`。
+- AI 助手进入问答页、切换文档、新增或流式生成消息时自动滚动到最新内容。
 
 ## 安装方式
 

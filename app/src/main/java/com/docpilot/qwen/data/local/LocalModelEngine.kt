@@ -3,6 +3,10 @@ package com.docpilot.qwen.data.local
 import android.content.Context
 import com.alibaba.mnnllm.android.llm.GenerateProgressListener
 import com.alibaba.mnnllm.android.llm.LlmSession
+import com.google.gson.Gson
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -15,7 +19,10 @@ data class LocalGenerationConfig(
     val enableMnn: Boolean = false
 ) {
     val backendType: Int
-        get() = if (accelerationEngine == "MNN (Arm SME2)") 13 else 0
+        get() = 0
+
+    val backendName: String
+        get() = "cpu"
 
     val precision: String
         get() = if (accelerationEngine == "MNN (Arm SME2)") "low" else "normal"
@@ -34,11 +41,14 @@ class MnnQwenEngine(
     context: Context,
     private val modelManager: LocalModelManager
 ) : LocalModelEngine {
+    private val appContext = context.applicationContext
     private val modelRoot = File(context.getExternalFilesDir(null), "models")
+    private val mmapRoot = File(appContext.cacheDir, "mnn_mmap").also { it.mkdirs() }
+    private val gson: Gson = GsonBuilder().disableHtmlEscaping().create()
 
     override fun runtimeStatus(): String {
         return when {
-            !MnnLlmNative.isRuntimeLoadable -> "MNN 原生推理暂不可用"
+            !MnnLlmNative.isRuntimeLoadable -> MnnLlmNative.loadFailureMessage()
             selectedConfigFile() == null -> "未选择 MNN 模型包"
             else -> "MNN 就绪"
         }
@@ -96,15 +106,16 @@ class MnnQwenEngine(
         if (!config.enableMnn) return null
         val configFile = selectedConfigFile() ?: return null
         if (!MnnLlmNative.isRuntimeLoadable) return null
+        val runtimeConfig = mergedRuntimeConfig(configFile, config)
+        val extraConfig = extraNativeConfig(configFile)
+        val supportsVision = selectedModelSupportsVision(configFile)
         return withContext(Dispatchers.IO) {
             MnnLlmNative.generate(
                 configPath = configFile.absolutePath,
                 prompt = prompt,
-                threads = config.threads.coerceIn(1, 8),
-                backendType = config.backendType,
-                precision = config.precision,
-                maxTokens = config.maxTokens,
-                imagePaths = config.imagePaths.takeIf { modelManager.selectedModel().contains("VL", ignoreCase = true) }.orEmpty(),
+                mergedConfigJson = runtimeConfig,
+                extraConfigJson = extraConfig,
+                imagePaths = config.imagePaths.takeIf { supportsVision }.orEmpty(),
                 onPartial = onPartial
             )
         }?.takeIf { it.isNotBlank() }
@@ -125,57 +136,95 @@ class MnnQwenEngine(
         )
         return candidates.firstOrNull { it.isFile && it.name == "config.json" }
     }
+
+    private fun mergedRuntimeConfig(configFile: File, config: LocalGenerationConfig): String {
+        val json = runCatching {
+            JsonParser.parseString(configFile.readText()).asJsonObject.deepCopy()
+        }.getOrDefault(JsonObject())
+
+        json.addProperty("backend_type", config.backendName)
+        json.addProperty("thread_num", config.threads.coerceIn(1, 8))
+        json.addProperty("precision", config.precision)
+        json.addProperty("memory", "low")
+        json.addProperty("max_new_tokens", config.maxTokens.coerceIn(64, 2048))
+        json.addProperty("use_mmap", true)
+        return gson.toJson(json)
+    }
+
+    private fun extraNativeConfig(configFile: File): String {
+        val cacheDir = File(mmapRoot, configFile.parentFile?.name ?: "default").also { it.mkdirs() }
+        return gson.toJson(JsonObject().apply {
+            addProperty("is_r1", false)
+            addProperty("mmap_dir", cacheDir.absolutePath)
+            addProperty("keep_history", false)
+        })
+    }
+
+    private fun selectedModelSupportsVision(configFile: File): Boolean {
+        val dir = configFile.parentFile ?: return false
+        return File(dir, "visual.mnn").isFile && File(dir, "visual.mnn.weight").isFile
+    }
 }
 
 object MnnLlmNative {
-    private const val ENABLE_NATIVE_MNN = false
-
-    val isRuntimeLoadable: Boolean by lazy {
-        if (!ENABLE_NATIVE_MNN) return@lazy false
+    private val loadResult: Result<Unit> by lazy {
         runCatching {
             System.loadLibrary("c++_shared")
             System.loadLibrary("MNN")
-            System.loadLibrary("docpilot_mnn_llm")
-        }.isSuccess
+            runCatching {
+                System.loadLibrary("docpilot_mnn_llm")
+            }.getOrElse {
+                System.loadLibrary("mnnllmapp")
+            }
+        }
+    }
+
+    val isRuntimeLoadable: Boolean
+        get() = loadResult.isSuccess
+
+    fun loadFailureMessage(): String {
+        return loadResult.exceptionOrNull()?.let {
+            "MNN 运行库加载失败：${it.message ?: it::class.java.simpleName}"
+        } ?: "MNN 原生推理暂不可用"
     }
 
     fun generate(
         configPath: String,
         prompt: String,
-        threads: Int,
-        backendType: Int,
-        precision: String,
-        maxTokens: Int,
+        mergedConfigJson: String,
+        extraConfigJson: String,
         imagePaths: List<String> = emptyList(),
         onPartial: suspend (String) -> Unit = {}
     ): String? {
         if (!isRuntimeLoadable) return null
         return runCatching {
             val generated = StringBuilder()
-            val runtimeConfig = """
-                {
-                  "backend_type": $backendType,
-                  "precision": "$precision",
-                  "thread_num": $threads,
-                  "max_new_tokens": $maxTokens
-                }
-            """.trimIndent()
             val session = LlmSession(configPath)
             try {
-                if (!session.init(runtimeConfig)) return@runCatching null
+                if (!session.init(mergedConfigJson, extraConfigJson)) return@runCatching null
                 val finalText = session.submit(prompt, imagePaths, object : GenerateProgressListener {
                     override fun onProgress(progress: String?): Boolean {
                         if (!progress.isNullOrBlank()) {
                             generated.append(progress)
-                            kotlinx.coroutines.runBlocking { onPartial(generated.toString()) }
+                            kotlinx.coroutines.runBlocking { onPartial(generated.toString().cleanMnnOutput()) }
                         }
                         return false
                     }
                 })
-                finalText.ifBlank { generated.toString() }
+                finalText.ifBlank { generated.toString() }.cleanMnnOutput()
             } finally {
                 session.release()
             }
         }.getOrNull()
+    }
+
+    private fun String.cleanMnnOutput(): String {
+        return replace(Regex("""(?is)<think>\s*</think>"""), "")
+            .replace(Regex("""(?is)<think>.*?</think>"""), "")
+            .replace("<think>", "")
+            .replace("</think>", "")
+            .lines()
+            .joinToString("\n") { it.trimEnd() }
+            .trim()
     }
 }

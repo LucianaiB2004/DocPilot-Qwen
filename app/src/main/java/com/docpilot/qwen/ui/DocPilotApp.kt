@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -598,6 +599,20 @@ private fun AssistantScreen(
     var question by rememberSaveable { mutableStateOf("") }
     var mode by rememberSaveable { mutableStateOf("问答") }
     var showAssistantSettings by rememberSaveable { mutableStateOf(false) }
+    val chatListState = rememberLazyListState()
+    val latestMessage = state.messages.lastOrNull()
+    LaunchedEffect(
+        mode,
+        state.selectedDocument?.id,
+        state.messages.size,
+        latestMessage?.id,
+        latestMessage?.content?.length,
+        latestMessage?.streaming
+    ) {
+        if (mode == "问答") {
+            chatListState.scrollToItem(state.messages.size + 1)
+        }
+    }
     ScreenFrame {
         Header(
             title = "AI 助手",
@@ -626,13 +641,18 @@ private fun AssistantScreen(
         )
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
             item {
-            StatusPill(icon = Icons.Default.AutoAwesome, text = "本地规则", color = Ink)
+                val localModeText = when {
+                    state.isCloudEnabled -> "云端 Qwen"
+                    state.localRuntimeStatus == "MNN 就绪" -> "MNN 本地"
+                    else -> "本地规则"
+                }
+                StatusPill(icon = Icons.Default.AutoAwesome, text = localModeText, color = Ink)
             }
             item {
-            StatusPill(icon = Icons.Default.TextSnippet, text = "TextIn 解析上下文", color = SuccessGreen)
+                StatusPill(icon = Icons.Default.TextSnippet, text = "TextIn 解析上下文", color = SuccessGreen)
             }
             item {
-            CompactCloudToggle(enabled = state.isCloudEnabled, onClick = { onCloudChange(!state.isCloudEnabled) })
+                CompactCloudToggle(enabled = state.isCloudEnabled, onClick = { onCloudChange(!state.isCloudEnabled) })
             }
         }
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -644,8 +664,12 @@ private fun AssistantScreen(
         CardBlock(modifier = Modifier.weight(1f)) {
             if (mode == "问答") {
                 SectionHeader("文档问答", state.selectedDocument?.name ?: "请选择文档")
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.weight(1f)) {
-                    item {
+                LazyColumn(
+                    state = chatListState,
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    item(key = "current-document") {
                         SourceTag("当前文档：${state.selectedDocument?.name ?: "未选择文档"}")
                     }
                     items(items = state.messages, key = { it.id }) { msg: ChatMessageEntity ->
@@ -656,6 +680,9 @@ private fun AssistantScreen(
                             streaming = msg.streaming,
                             onDelete = { onDeleteMessage(msg.id) }
                         )
+                    }
+                    item(key = "chat-bottom-anchor") {
+                        Spacer(Modifier.height(1.dp))
                     }
                 }
             } else {

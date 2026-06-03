@@ -3,14 +3,18 @@ package com.alibaba.mnnllm.android.llm
 class LlmSession(private val configPath: String) {
     private var nativeHandle: Long = 0L
 
-    fun init(runtimeConfig: String = "{}"): Boolean {
-        nativeHandle = initNative(configPath, runtimeConfig, emptyMap())
+    fun init(
+        mergedConfigJson: String = "{}",
+        extraConfigJson: String = "{}",
+        history: List<String>? = null
+    ): Boolean {
+        nativeHandle = initNative(configPath, history, mergedConfigJson, extraConfigJson)
         return nativeHandle != 0L
     }
 
     fun submit(prompt: String, progressListener: GenerateProgressListener): String {
         check(nativeHandle != 0L) { "MNN LLM session is not initialized" }
-        val result = submitNative(nativeHandle, prompt, progressListener)
+        val result = submitNative(nativeHandle, prompt, false, progressListener)
         return result["text"]?.toString().orEmpty()
     }
 
@@ -23,7 +27,7 @@ class LlmSession(private val configPath: String) {
             }
             append(prompt)
         }
-        val result = submitNative(nativeHandle, multimodalPrompt, progressListener)
+        val result = submitNative(nativeHandle, multimodalPrompt, false, progressListener)
         return result["text"]?.toString().orEmpty()
     }
 
@@ -35,14 +39,16 @@ class LlmSession(private val configPath: String) {
     }
 
     private external fun initNative(
-        configPath: String,
-        mergedConfigStr: String,
-        configMap: Map<String, Any>
+        configPath: String?,
+        history: List<String>?,
+        mergedConfigStr: String?,
+        configJsonStr: String?
     ): Long
 
     private external fun submitNative(
         instanceId: Long,
         input: String,
+        keepHistory: Boolean,
         listener: GenerateProgressListener
     ): HashMap<String, Any>
 
