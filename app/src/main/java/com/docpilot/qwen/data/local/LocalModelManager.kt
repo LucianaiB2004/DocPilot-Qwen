@@ -277,9 +277,47 @@ class LocalModelManager(private val context: Context) {
     private fun isModelAvailable(spec: LocalModelSpec): Boolean = availableModelFile(spec) != null
 
     private fun availableModelFile(spec: LocalModelSpec): File? {
-        return modelCandidates(spec).firstOrNull { file ->
-            file.isDirectory && spec.files.all { File(file, it).isFile } && verifyModelHashes(spec, file)
+        return modelCandidates(spec).firstNotNullOfOrNull { file ->
+            normalizeModelDirectory(spec, file)
         }
+    }
+
+    private fun normalizeModelDirectory(spec: LocalModelSpec, file: File): File? {
+        if (!file.isDirectory) return null
+        if (hasRequiredModelFiles(spec, file) && verifyModelHashes(spec, file)) return file
+
+        val nested = file.singleContentDirectory() ?: return null
+        if (!hasRequiredModelFiles(spec, nested) || !verifyModelHashes(spec, nested)) return null
+
+        return if (flattenSingleDirectory(file, nested) && hasRequiredModelFiles(spec, file) && verifyModelHashes(spec, file)) {
+            file
+        } else {
+            nested
+        }
+    }
+
+    private fun hasRequiredModelFiles(spec: LocalModelSpec, file: File): Boolean {
+        return spec.files.all { File(file, it).isFile }
+    }
+
+    private fun flattenSingleDirectory(parent: File, childDir: File): Boolean {
+        val children = childDir.listFiles()?.takeIf { it.isNotEmpty() } ?: return false
+        if (children.any { File(parent, it.name).exists() }) return false
+        var movedAll = true
+        children.forEach { child ->
+            movedAll = child.renameTo(File(parent, child.name)) && movedAll
+        }
+        if (movedAll) {
+            childDir.delete()
+        }
+        return movedAll
+    }
+
+    private fun File.singleContentDirectory(): File? {
+        val children = listFiles()
+            ?.filterNot { it.name == ".nomedia" || it.name == ".DS_Store" || it.name == "__MACOSX" }
+            ?: return null
+        return children.singleOrNull { it.isDirectory }?.takeIf { children.none { child -> child.isFile } }
     }
 
     private fun verifyModelHashes(spec: LocalModelSpec, modelDir: File): Boolean {

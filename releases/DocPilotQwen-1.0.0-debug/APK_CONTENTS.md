@@ -4,8 +4,8 @@
 包名：`com.docpilot.qwen`
 版本：`1.0.0` / `versionCode 1`
 文件：`DocPilotQwen-1.0.0-debug.apk`
-大小：`34,152,436 bytes`
-SHA-256：`63B5FFEFE6498A4BBB6B2E6D709F644748B815EDC97A1FC1EA7B99AA21E3A0D5`
+大小：`34,488,111 bytes`
+SHA-256：`579FF7D90CA066A8C6E10745DE8880968C48874A0CB8A8A0C2B97659EBB11A79`
 
 ## 本包包含
 
@@ -43,6 +43,7 @@ SHA-256：`63B5FFEFE6498A4BBB6B2E6D709F644748B815EDC97A1FC1EA7B99AA21E3A0D5`
 - 启用 Qwen MNN 模型包配置合并、mmap 缓存和本地输出清理。
 - AI 助手在 MNN 可用时显示 `MNN 本地`，生成记录来源标记为 `MNN`。
 - AI 助手进入问答页、切换文档、新增或流式生成消息时自动滚动到最新内容。
+- 自动识别并归并模型目录中的“外层文件夹只包含一个子文件夹”结构，避免 MNN 模型包多套一层后不可用。
 
 ## 安装方式
 

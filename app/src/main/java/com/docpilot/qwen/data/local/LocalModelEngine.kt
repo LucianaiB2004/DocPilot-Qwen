@@ -134,7 +134,15 @@ class MnnQwenEngine(
             File(file, "config.json"),
             File(modelRoot, file.nameWithoutExtension).resolve("config.json")
         )
-        return candidates.firstOrNull { it.isFile && it.name == "config.json" }
+        candidates.firstOrNull { it.isFile && it.name == "config.json" }?.let { return it }
+        return file.singleContentDirectory()?.let { File(it, "config.json") }?.takeIf { it.isFile }
+    }
+
+    private fun File.singleContentDirectory(): File? {
+        val children = listFiles()
+            ?.filterNot { it.name == ".nomedia" || it.name == ".DS_Store" || it.name == "__MACOSX" }
+            ?: return null
+        return children.singleOrNull { it.isDirectory }?.takeIf { children.none { child -> child.isFile } }
     }
 
     private fun mergedRuntimeConfig(configFile: File, config: LocalGenerationConfig): String {
